@@ -77,8 +77,9 @@ if(NOT TARGET xt::wgpu_native)
 endif()
 message(STATUS "xt_wgpu: wgpu-native from ${_xt_wgpu_dir}")
 
-# T-671: WGPUDeviceExtras.memoryHints (wgpu-native PR #619; not in the pinned v29.0.1.1) -> the
-# XT_WGPU_MEMORY_HINTS switch of WgpuInit::headless. Re-checked on every configure: the directory may change.
+# T-671: WGPUDeviceExtras.memoryHints (wgpu-native PR #619; in the win_x64 pin b83eb64 since T-690, not in the
+# linux_x64 / mac_arm64 pin v29.0.1.1) -> the XT_WGPU_MEMORY_HINTS switch of WgpuInit::headless. Re-checked on
+# every configure: the directory may change.
 include(CheckStructHasMember)
 unset(XT_WGPU_HAS_MEMORY_HINTS CACHE)
 set(_xt_wgpu_saved_includes "${CMAKE_REQUIRED_INCLUDES}")

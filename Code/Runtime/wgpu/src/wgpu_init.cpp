@@ -252,7 +252,8 @@ std::string memoryHintsFromEnv(WGPUDeviceExtras& extras) {
            " is not performance, usage or manual:<startMiB>:<maxMiB>)";
 }
 #else
-/// The pinned wgpu-native has no memory hints (built-in Performance): a set XT_WGPU_MEMORY_HINTS is ignored.
+/// A wgpu-native without memory hints (the v29.0.1.1 pin of Linux / macOS; built-in Performance): a set
+/// XT_WGPU_MEMORY_HINTS is ignored.
 std::string memoryHintsNote() {
     const std::string value = envString("XT_WGPU_MEMORY_HINTS");
     std::string text = "memory hints performance (built in)";

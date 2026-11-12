@@ -79,11 +79,21 @@ software adapter, `XT_WGPU_BACKEND=vulkan|d3d12|metal|gl` picks one).
 ## wgpu-native
 
 The pinned version, per-platform download URL and SHA-256 are in `Code/SDKs/versions_backends.cmake`
-(currently the upstream v29.0.1.1 release archives for win_x64, linux_x64 and mac_arm64). The first
+(currently: win_x64 a prebuilt of upstream commit b83eb64, unmodified source, attached to this
+repository's release `wgpu-native-b83eb64`; linux_x64 and mac_arm64 the upstream v29.0.1.1 release
+archives). The first
 configure downloads the archive of this platform, checks its hash and unpacks it into
 `runtime/Code/SDKs/_fetched/wgpu-native/<platform>/` (git-ignored, shared by every build tree);
 `-DXT_SDK_OFFLINE=ON` never downloads and expects that directory to be filled already. A platform
 without an archive configures without `xt_wgpu` instead of failing.
+
+Memory hints: the b83eb64 build has `WGPUDeviceExtras.memoryHints`, which the configure step detects
+(`XT_WGPU_HAS_MEMORY_HINTS`). On win_x64 the GPU target therefore uses the block strategy of
+`XT_WGPU_MEMORY_HINTS` (`performance` | `usage` | `manual:<startMiB>:<maxMiB>`; unset = `manual:32:64`)
+and logs it when a target is created (`memory hints manual 32..64 MiB (default)`). The v29.0.1.1 builds
+of linux_x64 and mac_arm64 have no memory hints and ignore the variable. To try another wgpu-native
+commit, build it with `Tools/Scripts/build_wgpu_native_trunk.sh` and point `XT_WGPU_NATIVE_OVERRIDE_DIR`
+(or the `vs2022-wgpu-trunk` preset) at it.
 
 ## Migrating from XTFrame-Runtime (hosts that use the GPU target)
 
@@ -126,4 +136,4 @@ MIT. See [`LICENSE`](LICENSE). Third-party components and their licenses are lis
 
 ---
 
-Exported from XTFrame 93ed053e7a06 (2026-11-12, version 0.16.0).
+Exported from XTFrame 76eceaf79192 (2026-11-12, version 0.16.0).

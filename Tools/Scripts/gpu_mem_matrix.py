@@ -11,7 +11,7 @@ How to build the trunk wgpu-native and the probes (Windows; the main checkout or
     cmake --preset vs2022-wgpu-trunk
     cmake --build --preset vs2022-wgpu-trunk-release --target xt_gpu_mem_probe   # the "trunk" build
     cmake --preset vs2022 -DXT_BUILD_CAPI=ON
-    cmake --build --preset vs2022-release --target xt_gpu_mem_probe              # the "pinned" build (v29.0.1.1)
+    cmake --build --preset vs2022-release --target xt_gpu_mem_probe              # the "pinned" build (Windows: b83eb64, has memory hints since T-690)
 
 How to run: `python Tools/Scripts/gpu_mem_matrix.py` runs every combination of the default config
 (Tools/Scripts/gpu_mem_matrix.default.json: memory hints x msaa x backend x power x trim per build) one probe
