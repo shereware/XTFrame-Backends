@@ -1,0 +1,37 @@
+{
+  "_comment": "T-671 (Docs/design/50-c-abi.md §50.ab addendum 2, item 4): the default matrix of Tools/Scripts/gpu_mem_matrix.py. Paths are relative to the repository root unless absolute. Each matrix entry is expanded as memory_hints x msaa x backend x power x trim for its build.",
+  "bundle": "E:/coding4/Sherefox/ui/bundle",
+  "sequence": "title,paper,vn,investigate,board,debate,result",
+  "rounds": 3,
+  "frames_per_scene": 60,
+  "width": 1920,
+  "height": 1080,
+  "mode": "hide",
+  "image_budget": "default",
+  "_comment_host_flow": "T-683 (50 §50.ad): the host flow -- every surface created hidden and updated for prewarm_hidden frames before the first show, the bundle's own fonts only.",
+  "prewarm_hidden": 120,
+  "system_fonts": false,
+  "timeout_s": 300,
+  "builds": {
+    "trunk": "bin/win_x64/Release-wgputrunk/tests/xt_gpu_mem_probe.exe",
+    "pinned": "bin/win_x64/Release/tests/xt_gpu_mem_probe.exe"
+  },
+  "matrix": [
+    {
+      "build": "trunk",
+      "memory_hints": ["performance", "usage", "manual:16:64", "manual:32:64", "manual:32:128"],
+      "msaa": [4, 1],
+      "backend": ["d3d12"],
+      "power": ["high", "low"],
+      "trim": [0]
+    },
+    {
+      "build": "pinned",
+      "memory_hints": ["performance"],
+      "msaa": [4, 1],
+      "backend": ["d3d12"],
+      "power": ["high", "low"],
+      "trim": [0]
+    }
+  ]
+}

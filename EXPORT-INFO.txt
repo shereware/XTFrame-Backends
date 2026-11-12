@@ -1,0 +1,7 @@
+XTFrame backends export (Tools/Scripts/export_backends.sh)
+source-commit: 93ed053e7a060f12f72c2f5fcf40dea90ccdc792
+source-short: 93ed053e7a06
+source-date: 2026-11-12
+version: 0.16.0
+files: 132 exported + 8 generated
+submodule: runtime 92206425466b6ca1caea9847e1285e29e131a6a1
