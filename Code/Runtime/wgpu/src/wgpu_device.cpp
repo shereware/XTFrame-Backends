@@ -358,6 +358,7 @@ void WgpuDevice::shutdown() {
     m_ownPool.clear();
     m_frameTargets.clear();
     releaseSurfaceAttachments();
+    releaseLayerAttachments();  // T-701
     if (m_queue != nullptr) {
         wgpuQueueRelease(m_queue);
         m_queue = nullptr;
@@ -769,6 +770,23 @@ bool WgpuDevice::ensureSurfaceAttachments() {
     }
     if (m_surfaceStencil != nullptr && m_surfaceAttachW == m_width && m_surfaceAttachH == m_height) {
         return true;
+    }
+    if (m_surfaceNoStencil && m_sharing == nullptr) {
+        // T-703: a layer target acquired without stencil -- only the 4x attachment, if any.
+        if (m_surfaceAttachW == m_width && m_surfaceAttachH == m_height &&
+            (m_sampleCount == 1 || m_surfaceMsaaView != nullptr)) {
+            return true;
+        }
+        releaseSurfaceAttachments();
+        if (m_sampleCount > 1) {
+            m_surfaceMsaa = makeTexture(m_device, "xt_wgpu surface msaa", static_cast<uint32_t>(m_width),
+                                        static_cast<uint32_t>(m_height), m_targetFormat, m_sampleCount,
+                                        WGPUTextureUsage_RenderAttachment);
+            m_surfaceMsaaView = makeView(m_surfaceMsaa);
+        }
+        m_surfaceAttachW = m_width;
+        m_surfaceAttachH = m_height;
+        return m_sampleCount == 1 || m_surfaceMsaaView != nullptr;
     }
     releaseSurfaceAttachments();
     if (m_sharing != nullptr) {
@@ -1303,7 +1321,7 @@ void WgpuDevice::encodePass(WGPUCommandEncoder enc, size_t index, bool& surfaceS
     if (pass.target == gpu::kSurfaceTarget) {
         colorView = m_sampleCount > 1 ? m_surfaceMsaaView : m_surface;
         resolveView = m_sampleCount > 1 && m_resolveSurface[index] != 0 ? m_surface : nullptr;  // T-658
-        stencilView = m_surfaceStencilView;
+        stencilView = surfaceStencilView();  // T-703: none for a layer acquired without stencil
         const bool first = !surfaceStarted;
         clearColor = (first && m_clearSurface) || pass.clear != 0;
         if (first && m_clearSurface && pass.clear == 0) {

@@ -92,6 +92,9 @@ public:
     const char* adapterName() const { return m_renderer.adapterName(); }
     const char* lastError() const { return m_error.c_str(); }
     xt::wgpu::WgpuRenderer& renderer() { return m_renderer; }
+    /// T-701: the view of the frame beginFrame() acquired (null when the frame is skipped), for a
+    /// host that draws a frame of its own into it (gpu::buildWorldLayerQuads) in place of render().
+    WGPUTextureView frameView() const { return m_frameView; }
 
 private:
     bool initDevice(uint32_t sampleCount, WGPUTextureFormat format);

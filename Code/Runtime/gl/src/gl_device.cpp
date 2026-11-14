@@ -245,6 +245,8 @@ void GlDevice::shutdown() {
         glDeleteTextures(1, &t.name);
     }
     m_textures.clear();
+    destroyLayerScratch();     // T-701
+    m_layerNoStencil.clear();  // T-703
     m_pool.shutdown();
     m_geometry.shutdown();
     m_effects.shutdown();
@@ -603,6 +605,159 @@ gpu::TextureHandle GlDevice::acquireCachedTarget(uint16_t w, uint16_t h, gpu::Te
     m_textures.push_back(Texture{c.texture, gpu::TextureFormat::Rgba8, GL_LINEAR});
     ++m_cache.stats.cachedTargetCreates;
     return c.texture;
+}
+
+// -- T-701 world layers (Docs/design/33-world-layers.md §33.8). --
+
+gpu::TextureHandle GlDevice::acquireLayerTarget(uint32_t layerId, uint16_t w, uint16_t h) {
+    return acquireLayerTargetWithStencil(layerId, w, h, true);
+}
+
+gpu::TextureHandle GlDevice::acquireLayerTargetWithStencil(uint32_t layerId, uint16_t w, uint16_t h,
+                                                           bool stencil) {
+    (void)layerId;
+    const gpu::TextureHandle target = acquireCachedTarget(w, h, gpu::TextureFormat::Rgba8);
+    if (target != 0 && !stencil) {
+        m_layerNoStencil.push_back(static_cast<GLuint>(target));
+    }
+    return target;
+}
+
+void GlDevice::releaseLayerTarget(gpu::TextureHandle target) {
+    m_layerNoStencil.erase(
+        std::remove(m_layerNoStencil.begin(), m_layerNoStencil.end(), static_cast<GLuint>(target)),
+        m_layerNoStencil.end());
+    releaseCachedTarget(target);
+}
+
+void GlDevice::destroyLayerScratch() {
+    if (m_layerScratchFbo != 0) glDeleteFramebuffers(1, &m_layerScratchFbo);
+    if (m_layerScratchColorFbo != 0) glDeleteFramebuffers(1, &m_layerScratchColorFbo);
+    if (m_layerScratchColor != 0) glDeleteRenderbuffers(1, &m_layerScratchColor);
+    if (m_layerScratchStencil != 0) glDeleteRenderbuffers(1, &m_layerScratchStencil);
+    m_layerScratchFbo = m_layerScratchColorFbo = m_layerScratchColor = m_layerScratchStencil = 0;
+    m_layerScratchW = m_layerScratchH = 0;
+}
+
+bool GlDevice::ensureLayerScratch(int w, int h, bool stencil) {
+    if (m_layerScratchColorFbo == 0 || m_layerScratchW < w || m_layerScratchH < h) {
+        const int newW = std::max(w, m_layerScratchW), newH = std::max(h, m_layerScratchH);
+        destroyLayerScratch();
+        glGenRenderbuffers(1, &m_layerScratchColor);
+        glBindRenderbuffer(GL_RENDERBUFFER, m_layerScratchColor);
+        glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, newW, newH);
+        glBindRenderbuffer(GL_RENDERBUFFER, 0);
+        glGenFramebuffers(1, &m_layerScratchColorFbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, m_layerScratchColorFbo);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, m_layerScratchColor);
+        const bool ok = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+        m_cache.invalidateFramebuffers();
+        if (!ok) {
+            destroyLayerScratch();
+            return false;
+        }
+        m_layerScratchW = newW;
+        m_layerScratchH = newH;
+    }
+    if (!stencil || m_layerScratchFbo != 0) {
+        return true;
+    }
+    // T-703: the stencil only once a layer needs it, as large as the scratch color.
+    glGenRenderbuffers(1, &m_layerScratchStencil);
+    glBindRenderbuffer(GL_RENDERBUFFER, m_layerScratchStencil);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, m_layerScratchW, m_layerScratchH);
+    glBindRenderbuffer(GL_RENDERBUFFER, 0);
+    glGenFramebuffers(1, &m_layerScratchFbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, m_layerScratchFbo);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, m_layerScratchColor);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER,
+                              m_layerScratchStencil);
+    const bool ok = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+    m_cache.invalidateFramebuffers();
+    if (!ok) {
+        glDeleteFramebuffers(1, &m_layerScratchFbo);
+        glDeleteRenderbuffers(1, &m_layerScratchStencil);
+        m_layerScratchFbo = m_layerScratchStencil = 0;
+        return false;
+    }
+    return true;
+}
+
+void GlDevice::submitLayer(gpu::TextureHandle target, const gpu::GpuFrame& frame) {
+    const CachedTarget* layer = nullptr;
+    for (const CachedTarget& c : m_cached) {
+        if (c.texture == target) {
+            layer = &c;
+            break;
+        }
+    }
+    if (layer == nullptr) {
+        m_lastError = "submitLayer: not a layer target of this device";
+        return;
+    }
+    const int w = layer->width, h = layer->height;
+    const GLuint layerFbo = layer->fbo;  // `layer` may move while the frame is drawn
+    GLint prevDraw = 0, prevRead = 0;
+    GLint prevViewport[4] = {0, 0, 0, 0};
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevDraw);
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prevRead);
+    glGetIntegerv(GL_VIEWPORT, prevViewport);
+    const bool stencil = std::find(m_layerNoStencil.begin(), m_layerNoStencil.end(),
+                                   static_cast<GLuint>(target)) == m_layerNoStencil.end();
+    if (!ensureLayerScratch(w, h, stencil)) {
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(prevDraw));
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(prevRead));
+        m_lastError = "submitLayer: the layer scratch framebuffer could not be created";
+        return;
+    }
+    // The scratch stands in for the surface: its rows [0, h) are the layer (the device's surface
+    // rows are bottom-up, so a taller scratch only has unused rows above).
+    // T-703: without stencil when the layer's target was acquired so (the color is the same).
+    const GLuint scratch = stencil ? m_layerScratchFbo : m_layerScratchColorFbo;
+    glBindFramebuffer(GL_FRAMEBUFFER, scratch);
+    glDisable(GL_SCISSOR_TEST);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glStencilMask(0xFFu);
+    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+    glClearStencil(0);
+    glClear(stencil ? (GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT) : GL_COLOR_BUFFER_BIT);
+    const GLuint surface = m_surface;
+    const int width = m_width, height = m_height;
+    m_surface = scratch;
+    m_width = w;
+    m_height = h;
+    submit(frame);
+    m_surface = surface;
+    m_width = width;
+    m_height = height;
+    // Into the layer's texture with the rows flipped: sampled top-down like an uploaded texture.
+    glDisable(GL_SCISSOR_TEST);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, scratch);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, layerFbo);
+    glBlitFramebuffer(0, 0, w, h, 0, h, w, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(prevDraw));
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(prevRead));
+    glViewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
+    m_cache.invalidateFramebuffers();
+}
+
+bool GlDevice::readTarget(gpu::TextureHandle target, std::vector<uint8_t>& rgba, int& width, int& height) {
+    for (const CachedTarget& c : m_cached) {
+        if (c.texture != target) continue;
+        width = c.width;
+        height = c.height;
+        rgba.resize(static_cast<size_t>(c.width) * static_cast<size_t>(c.height) * 4u);
+        GLint prevRead = 0;
+        glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prevRead);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, c.fbo);
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        // The target's texel row 0 already is the picture's top row (submitLayer's flipped blit).
+        glReadPixels(0, 0, c.width, c.height, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(prevRead));
+        m_cache.invalidateFramebuffers();
+        return true;
+    }
+    return false;
 }
 
 void GlDevice::releaseCachedTarget(gpu::TextureHandle target) {

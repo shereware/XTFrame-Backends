@@ -84,6 +84,24 @@ public:
     void releaseCachedTarget(gpu::TextureHandle target) override;
     uint32_t prepareCustomEffect(std::string_view glsl, const char* names, const uint8_t* types,
                                  uint32_t count) override;
+    /// T-701 (Docs/design/33-world-layers.md §33.8): a world layer's target is a cached target (an
+    /// RGBA8 texture whose name is the handle, rows top-down like an uploaded texture).
+    /// `submitLayer` draws the frame into this device's layer scratch (a single-sample RGBA8 +
+    /// stencil renderbuffer pair that only grows, cleared first) in the place of the surface, then
+    /// blits it into the target with the rows flipped. The caller's framebuffer bindings and
+    /// viewport are put back; the rest of the GL state is left as `submit` leaves it. T-703: a
+    /// target acquired with `stencil` false is drawn through a color-only framebuffer on the same
+    /// scratch color; the stencil renderbuffer is created only once a layer that needs it is drawn.
+    /// `acquireLayerTarget` = with stencil.
+    gpu::TextureHandle acquireLayerTarget(uint32_t layerId, uint16_t w, uint16_t h) override;
+    gpu::TextureHandle acquireLayerTargetWithStencil(uint32_t layerId, uint16_t w, uint16_t h,
+                                                     bool stencil) override;
+    void releaseLayerTarget(gpu::TextureHandle target) override;
+    void submitLayer(gpu::TextureHandle target, const gpu::GpuFrame& frame) override;
+    /// T-701: the pixels of a layer (or other cached) target as premultiplied RGBA8, row 0 = top,
+    /// into `rgba` (resized); false for a handle this device did not acquire. The caller's read
+    /// framebuffer binding is put back.
+    bool readTarget(gpu::TextureHandle target, std::vector<uint8_t>& rgba, int& width, int& height);
     /// T-343: target 0 is whatever FBO the host bound (`setSurface`); glBlitFramebuffer reads it
     /// back for the Direct mode's region copies (a multisampled surface resolves in the blit).
     bool supportsDirectTarget() const override { return true; }
@@ -222,6 +240,19 @@ private:
     std::vector<FreeCachedTarget> m_cachedFree;
     uint64_t m_cachedFreeBytes = 0;
     uint32_t m_frameCounter = 0;  ///< submits so far (stamps the free list)
+    /// T-701: submitLayer's draw target (color + stencil renderbuffers of `m_layerScratchW` x
+    /// `m_layerScratchH`, at least the largest layer drawn so far). T-703: `m_layerScratchFbo`
+    /// (color + stencil) and the stencil renderbuffer exist only once a layer that needs the stencil
+    /// was drawn; `m_layerScratchColorFbo` (the same color, no stencil) draws the others.
+    GLuint m_layerScratchFbo = 0;
+    GLuint m_layerScratchColorFbo = 0;
+    GLuint m_layerScratchColor = 0;
+    GLuint m_layerScratchStencil = 0;
+    int m_layerScratchW = 0, m_layerScratchH = 0;
+    /// T-703: the layer targets acquired without stencil (texture names).
+    std::vector<GLuint> m_layerNoStencil;
+    bool ensureLayerScratch(int w, int h, bool stencil);
+    void destroyLayerScratch();
 
     // -- Per-submit state --
     const gpu::GpuFrame* m_frame = nullptr;

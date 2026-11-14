@@ -11,6 +11,8 @@ add_executable(xt_wgpu_tests
     test_wgpu_mips.cpp  # T-665
     test_wgpu_pack_bc7.cpp  # T-687
     test_wgpu_capabilities.cpp  # T-691
+    test_wgpu_affine_plane.cpp  # T-700
+    test_wgpu_world_layers.cpp  # T-701
 )
 target_include_directories(xt_wgpu_tests SYSTEM PRIVATE ${PROJECT_SOURCE_DIR}/Code/SDKs/doctest)
 target_compile_definitions(xt_wgpu_tests PRIVATE DOCTEST_CONFIG_USE_STD_HEADERS)
@@ -19,6 +21,8 @@ target_include_directories(xt_wgpu_tests PRIVATE ${XT_BACKENDS_SOURCE_DIR}/Code/
 # T-438: the draw cases compare with xt::sw (golden_common.h's compareRgba) and compile fixtures.
 target_link_libraries(xt_wgpu_tests PRIVATE xt_wgpu xt_gpu xt_core xt_compile xt_sw xt_golden_fixtures)
 target_compile_definitions(xt_wgpu_tests PRIVATE XT_GOLDEN_UI_DIR="${PROJECT_SOURCE_DIR}/Tests/golden/ui")
+# T-700: test_wgpu_affine_plane.cpp shapes text with the test fonts.
+target_compile_definitions(xt_wgpu_tests PRIVATE XT_TEST_FONTS_DIR="${PROJECT_SOURCE_DIR}/Tests/fonts")
 # T-687: test_wgpu_pack_bc7.cpp packs a UI Project (xt_bundle) built by Tests/bundle/t687_project.h.
 target_link_libraries(xt_wgpu_tests PRIVATE xt_bundle)
 target_include_directories(xt_wgpu_tests PRIVATE ${PROJECT_SOURCE_DIR}/Tests/bundle)

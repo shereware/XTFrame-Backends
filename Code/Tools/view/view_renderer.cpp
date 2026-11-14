@@ -2,8 +2,12 @@
 
 #include <cstdio>
 
+#include "xt/gpu/gpu_frame.h"
 #include "xt_platform_sdl2.h"
 #include "xt_renderer_sw.h"
+#ifndef XT_BACKEND_NO_TEXT
+#include "xt/text/glyph_atlas.h"
+#endif
 #ifdef XT_VIEW_GL
 #include "xt_renderer_gl3.h"
 #endif
@@ -52,6 +56,66 @@ backend::Sdl2Options windowOptions(const FrameTargetConfig& config, backend::Sdl
         h = config.height;
     }
 }
+
+/// T-701: what the gl and wgpu targets share for world layers: the builder on the renderer's device
+/// and an atlas of its own for the layers' text (the frame renderer's atlas has one consumer).
+struct LayerHost {
+    gpu::WorldLayerBuilder builder;
+    gpu::GpuFrame quads;
+    bool ready = false;
+#ifndef XT_BACKEND_NO_TEXT
+    text::FtTextShaper* shaper = nullptr;
+    std::unique_ptr<text::GlyphAtlas> atlas;
+#endif
+
+    bool begin(gpu::GpuDevice* device, std::string& error) {
+        if (device == nullptr) {
+            error = "no device";
+            return false;
+        }
+        if (!ready) {
+            builder.init(*device);
+#ifndef XT_BACKEND_NO_TEXT
+            if (shaper != nullptr) {
+                atlas = std::make_unique<text::GlyphAtlas>(*shaper, 2048, 512);
+                builder.setGlyphAtlas(atlas.get());
+            }
+#endif
+            ready = true;
+        }
+        return true;
+    }
+    bool build(const CommandList& list, TextShaper* textShaper, AssetResolver* assets, const IrView* ir,
+               PerfTracker* perf, float density, std::string& error) {
+        builder.setDensity(density);
+        if (!builder.build(list, textShaper, assets, ir, perf)) {
+            // T-703 (33 §33.13 item 3): the status, not the text, tells "no layer targets" apart.
+            switch (builder.status()) {
+                case gpu::WorldLayerBuilder::BuildStatus::Unsupported:
+                    error = "the renderer's device has no world-layer targets";
+                    break;
+                case gpu::WorldLayerBuilder::BuildStatus::NoLayers:
+                    error = "the frame was not painted in world-layer output";
+                    break;
+                default:
+                    error = builder.lastError();
+                    break;
+            }
+            return false;
+        }
+        builder.submit();
+        return true;
+    }
+    void end() {
+        if (ready) {
+            builder.shutdown();
+#ifndef XT_BACKEND_NO_TEXT
+            atlas.reset();
+#endif
+            ready = false;
+        }
+    }
+};
 
 /// sw in a window: xt_sw into a buffer, SDL_Renderer blit.
 class SwWindowTarget final : public FrameTarget {
@@ -156,16 +220,50 @@ public:
     }
     double seconds() const override { return m_platform.seconds(); }
 #ifndef XT_BACKEND_NO_TEXT
-    void setTextShaper(text::FtTextShaper* shaper) override { m_renderer.setTextShaper(shaper); }
+    void setTextShaper(text::FtTextShaper* shaper) override {
+        m_renderer.setTextShaper(shaper);
+        m_layers.shaper = shaper;
+    }
 #endif
     std::string description() const override {
         return m_windowed ? "gl (sdl2 window)" : "gl (offscreen FBO)";
+    }
+    ~GlTarget() override {
+        m_platform.glMakeCurrent();
+        m_layers.end();  // before the renderer (its device) goes
+    }
+    bool supportsLayers() const override { return true; }
+    bool renderLayers(const CommandList& list, TextShaper* shaper, AssetResolver* assets, const IrView* ir,
+                      PerfTracker* perf, float density, std::string& error) override {
+        m_platform.glMakeCurrent();
+        return m_layers.begin(m_renderer.renderer().device(), error) &&
+               m_layers.build(list, shaper, assets, ir, perf, density, error);
+    }
+    std::span<const gpu::WorldLayer> layers() const override { return m_layers.builder.layers(); }
+    gpu::WorldLayerBuilder::Stats layerStats() const override { return m_layers.builder.stats(); }
+    bool readLayer(const gpu::WorldLayer& layer, std::vector<uint8_t>& rgba) override {
+        int w = 0, h = 0;
+        if (!m_renderer.renderer().readLayerTarget(layer.texture, rgba, w, h)) return false;
+        unpremultiply(rgba);
+        return true;
+    }
+    void drawLayers(const Mat4& boxToSurface) override {
+        m_platform.glMakeCurrent();
+        m_renderer.beginFrame();  // binds and clears the frame's FBO
+        gpu::buildWorldLayerQuads(m_layers.builder.layers(), boxToSurface, m_renderer.width(),
+                                  m_renderer.height(), /*clear=*/false, m_layers.quads);
+        m_renderer.renderer().submitFrame(m_layers.quads);
+    }
+    void frameSize(int& width, int& height) const override {
+        width = m_renderer.width();
+        height = m_renderer.height();
     }
 
 private:
     // The renderer is destroyed (its GL objects) while the platform's context still exists.
     backend::PlatformSdl2 m_platform;
     backend::RendererGl3 m_renderer;
+    LayerHost m_layers;
     bool m_windowed = false;
 };
 #endif
@@ -215,6 +313,7 @@ public:
             }
         }
         m_renderer.setClearColor(config.clear);
+        m_clear = config.clear;
         return true;
     }
     bool windowed() const override { return m_windowed; }
@@ -241,11 +340,52 @@ public:
     void present() override { m_renderer.present(); }
     double seconds() const override { return m_windowed ? m_platform.seconds() : 0.0; }
 #ifndef XT_BACKEND_NO_TEXT
-    void setTextShaper(text::FtTextShaper* shaper) override { m_renderer.setTextShaper(shaper); }
+    void setTextShaper(text::FtTextShaper* shaper) override {
+        m_renderer.setTextShaper(shaper);
+        m_layers.shaper = shaper;
+    }
 #endif
     std::string description() const override {
         return std::string("wgpu ") + (m_windowed ? "(sdl2 window, " : "(offscreen, ") +
                m_renderer.adapterName() + ")";
+    }
+    ~WgpuTarget() override { m_layers.end(); }  // before the renderer (its device) goes
+    bool supportsLayers() const override { return true; }
+    bool renderLayers(const CommandList& list, TextShaper* shaper, AssetResolver* assets, const IrView* ir,
+                      PerfTracker* perf, float density, std::string& error) override {
+        return m_layers.begin(m_renderer.renderer().device(), error) &&
+               m_layers.build(list, shaper, assets, ir, perf, density, error);
+    }
+    std::span<const gpu::WorldLayer> layers() const override { return m_layers.builder.layers(); }
+    gpu::WorldLayerBuilder::Stats layerStats() const override { return m_layers.builder.stats(); }
+    bool readLayer(const gpu::WorldLayer& layer, std::vector<uint8_t>& rgba) override {
+        xt::wgpu::WgpuDevice* device = m_renderer.renderer().device();
+        WGPUTexture texture = device != nullptr ? device->texture(layer.texture) : nullptr;
+        if (texture == nullptr) return false;
+        rgba.resize(static_cast<size_t>(layer.texWidth) * static_cast<size_t>(layer.texHeight) * 4u);
+        if (!m_renderer.renderer().readback(texture, std::span<uint8_t>(rgba))) return false;
+        unpremultiply(rgba);
+        return true;
+    }
+    void drawLayers(const Mat4& boxToSurface) override {
+        m_renderer.beginFrame();
+        xt::wgpu::WgpuDevice* device = m_renderer.renderer().device();
+        WGPUTextureView view = m_renderer.frameView();
+        if (device == nullptr || view == nullptr) return;  // a skipped frame
+        gpu::buildWorldLayerQuads(m_layers.builder.layers(), boxToSurface, m_renderer.width(),
+                                  m_renderer.height(), /*clear=*/false, m_layers.quads);
+        m_renderer.renderer().setClearColor(m_clear.r * m_clear.a, m_clear.g * m_clear.a,
+                                            m_clear.b * m_clear.a, m_clear.a);
+        device->setSurface(view);
+        device->submit(m_layers.quads);
+        device->setSurface(nullptr);
+        if (device->lastSubmissionIndex() != 0) {
+            m_renderer.renderer().framesInFlight().noteSubmit(device->lastSubmissionIndex());
+        }
+    }
+    void frameSize(int& width, int& height) const override {
+        width = m_renderer.width();
+        height = m_renderer.height();
     }
     bool gpuCounters(GpuFrameCounters& out) override {
         const xt::wgpu::WgpuStats s = m_renderer.renderer().stats();
@@ -286,6 +426,8 @@ public:
 private:
     backend::PlatformSdl2 m_platform;
     backend::RendererWgpu m_renderer;  // destroyed first (declared last): the surface before the window
+    LayerHost m_layers;
+    Color m_clear{0.1f, 0.1f, 0.1f, 1.0f};
     bool m_windowed = false;
 };
 #endif

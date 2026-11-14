@@ -2,9 +2,12 @@
 
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 #include "xt/command_list.h"
 #include "xt/damage.h"
+#include "xt/gpu/gpu_device.h"
+#include "xt/gpu/gpu_frame.h"
 #include "xt/ir.h"
 #include "xt/perf.h"
 
@@ -153,6 +156,20 @@ public:
     /// T-662 (Docs/design/10-backends.md §10.11 item 2, supplement 2): `gpu::FrameBuilder::
     /// wantsAnotherFrame()` of the frame last built, as `WgpuRenderer::wantsAnotherFrame`.
     bool wantsAnotherFrame() const;
+
+    /// T-701 (Docs/design/33-world-layers.md §33.8): the device behind this renderer, for a
+    /// gpu::WorldLayerBuilder (its layer targets, `submitLayer`) and other device-level tools; as
+    /// `WgpuRenderer::device()`. Valid between init() and shutdown(), with this renderer's GL
+    /// context current. Calls made on it directly (a WorldLayerBuilder's build / submit) do not
+    /// save and restore the host's GL state the way render() does: framebuffer bindings and the
+    /// viewport are put back, everything else is left as the device's own drawing leaves it.
+    gpu::GpuDevice* device();
+    /// T-701: draws a frame the host built itself (gpu::buildWorldLayerQuads) into the currently
+    /// bound FBO, with render()'s state save / restore. The FBO is the `resize` size.
+    void submitFrame(const gpu::GpuFrame& frame);
+    /// T-701: the pixels of a world layer's target (`gpu::WorldLayer::texture`) as premultiplied
+    /// RGBA8, row 0 = top; false for a handle that is not a layer target of this renderer's device.
+    bool readLayerTarget(gpu::TextureHandle target, std::vector<uint8_t>& rgba, int& width, int& height);
 
 private:
     struct Impl;

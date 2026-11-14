@@ -158,6 +158,21 @@ public:
     void releaseCachedTarget(gpu::TextureHandle target) override;
     uint32_t prepareCustomEffect(std::string_view glsl, const char* names, const uint8_t* types,
                                  uint32_t count) override;
+    /// T-701 (Docs/design/33-world-layers.md §33.8): a world layer's target is an RGBA8Unorm
+    /// texture of this device's table (RENDER_ATTACHMENT | TEXTURE_BINDING | COPY_SRC | COPY_DST),
+    /// so `texture(handle)` gives the host the WGPUTexture to sample or read back. `submitLayer`
+    /// draws the frame as `submit` does with that texture as target 0 (cleared to transparent,
+    /// through a 4x attachment when the device's sample count is 4), then puts the surface's own
+    /// view, size, clear setting and attachments back; a device that shares no cache keeps the
+    /// stencil / 4x attachments of the last few layer sizes (kLayerAttachmentSets) so a layer that
+    /// is redrawn every frame creates none. T-703: a target acquired with `stencil` false is drawn
+    /// without a stencil attachment (none is created or borrowed for it; the 4x attachment stays);
+    /// `acquireLayerTarget` = with stencil.
+    gpu::TextureHandle acquireLayerTarget(uint32_t layerId, uint16_t w, uint16_t h) override;
+    gpu::TextureHandle acquireLayerTargetWithStencil(uint32_t layerId, uint16_t w, uint16_t h,
+                                                     bool stencil) override;
+    void releaseLayerTarget(gpu::TextureHandle target) override;
+    void submitLayer(gpu::TextureHandle target, const gpu::GpuFrame& frame) override;
     /// `limits.maxTextureDimension2D` as init read it.
     uint32_t maxTextureSize() const override { return m_maxTextureSize; }
     /// T-438: target 0 can be read back (a blit from the surface view, which then needs
@@ -253,10 +268,11 @@ public:
         WGPUTextureView view = nullptr;
         gpu::TextureFormat format = gpu::TextureFormat::Rgba8;
         uint16_t width = 0, height = 0;
-        bool external = false;  ///< view not owned (registerExternalTexture)
-        bool cached = false;    ///< an acquireCachedTarget target
-        uint32_t sharedId = 0;  ///< T-648: a use of WgpuSharedCache image `sharedId` (external)
-        uint32_t levels = 1;    ///< T-665: mip levels (a shared image: the cache's Image::levels)
+        bool external = false;        ///< view not owned (registerExternalTexture)
+        bool cached = false;          ///< an acquireCachedTarget target
+        uint32_t sharedId = 0;        ///< T-648: a use of WgpuSharedCache image `sharedId` (external)
+        uint32_t levels = 1;          ///< T-665: mip levels (a shared image: the cache's Image::levels)
+        bool layerNoStencil = false;  ///< T-703: a layer target acquired without stencil
     };
     /// One pooled offscreen target: `color` is drawn into (4x when `samples` is 4) and resolves
     /// into `resolve`; with one sample `resolve` is null and `color` is the sampleable texture.
@@ -347,6 +363,11 @@ private:
     WGPUTextureView m_surfaceStencilView = nullptr;
     int m_surfaceAttachW = 0, m_surfaceAttachH = 0;
     int m_attachmentSet = -1;  ///< T-675: index of the borrowed set in the cache (-1: none)
+    /// T-703: true only while submitLayer draws into a layer target acquired without stencil: the
+    /// surface passes then have no stencil attachment (and the device creates none of its own).
+    bool m_surfaceNoStencil = false;
+    /// The stencil view the surface passes attach (null while `m_surfaceNoStencil`).
+    WGPUTextureView surfaceStencilView() const { return m_surfaceNoStencil ? nullptr : m_surfaceStencilView; }
 
     // -- Per-submit state --
     const gpu::GpuFrame* m_frame = nullptr;
@@ -391,6 +412,21 @@ private:
     void countTextureCreate();
     /// T-665: requestMipChain's work (timed by it).
     uint32_t makeMipChain(gpu::TextureHandle tex, const void* storedLevels, uint32_t storedLevelCount);
+    /// T-701: the surface attachments submitLayer drew earlier layers with, by exact size (only
+    /// while the device shares no cache; a sharing device borrows the cache's sets by size).
+    /// T-703: a set without `stencil` serves the layers acquired without stencil.
+    struct LayerAttachments {
+        int width = 0, height = 0;
+        WGPUTexture msaa = nullptr;
+        WGPUTextureView msaaView = nullptr;
+        WGPUTexture stencil = nullptr;
+        WGPUTextureView stencilView = nullptr;
+        uint32_t lastUsed = 0;
+    };
+    static constexpr size_t kLayerAttachmentSets = 4;
+    std::vector<LayerAttachments> m_layerAttachments;
+    uint32_t m_layerSubmits = 0;
+    void releaseLayerAttachments();
     /// T-665: mip chains requestMipChain made (cumulative), their bytes and CPU time.
     uint32_t m_mipChains = 0;
     uint64_t m_mipBytes = 0;

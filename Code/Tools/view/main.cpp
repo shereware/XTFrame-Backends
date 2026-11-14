@@ -23,6 +23,7 @@
 #include "../Common/print_version.h"
 #include "../Common/standard_symbols_note.h"
 #include "view_flow.h"
+#include "view_layers.h"
 #include "view_renderer.h"
 #include "xt/animator.h"
 #include "xt/asset_resolver.h"
@@ -32,6 +33,7 @@
 #include "xt/bundle/project_runtime.h"
 #include "xt/bundle/symbol_library.h"
 #include "xt/bundle/ui_project.h"
+#include "xt/charconv.h"
 #include "xt/command_list.h"
 #include "xt/compile/compile.h"
 #include "xt/compile/utf8_path.h"
@@ -283,6 +285,16 @@
 /// software renderer for exactly --frames frames (default 60) instead, and exits 0 -- used by
 /// CTest, which has no display.
 ///
+/// --layers <dir> and --layers-view (T-701, Docs/design/33-world-layers.md, view_layers.h) draw the UI
+/// in world-layer output on a GPU renderer (wgpu when built in, else gl, unless --renderer says): every
+/// element with `world-layer: on` is drawn into a texture of its own. --layers <dir> (headless unless
+/// --layers-view is given too) writes each layer as `layer-<order>-<id>.png`, the list a host needs as
+/// `layers.json` (also printed) and `preview.png`, the layers standing in space as the viewer's own
+/// camera sees them. --layers-view opens a window on that view: drag with the right (or middle) button
+/// to turn the camera, the wheel changes the depth scale, everything else reaches the UI as a ray
+/// through the camera. --layers-yaw / --layers-pitch (degrees), --layers-depth (the depth scale) and
+/// --layers-density (texels per logical px, default the frame's) set the starting values.
+///
 /// --renderer sw|gl|wgpu (T-439, view_renderer.h) picks one of the renderers built in (the default is
 /// unchanged: xt_sw under --headless, else the shell's -- gl, or sw for an XT_SHELL_GL=OFF build). Under
 /// --headless gl and wgpu render the frames offscreen (an FBO of a hidden GL window; a headless WebGPU
@@ -393,6 +405,10 @@ struct Args {
     std::vector<ScriptedPointer> pointers;  // --pointer, in the order given.
     std::vector<std::pair<std::string, std::string>> bindTextures;  // --bind-texture name=png (T-150).
     bool headless = false;
+    // T-701 (33): --layers <dir>, --layers-view and the layers view's starting camera.
+    std::string layersDir;
+    bool layersView = false;
+    xt::view::LayerViewOptions layerOptions;
     bool transparent = false;   // T-342: --transparent (headless clear colour alpha 0).
     std::string scene;          // T-343: --scene <png>: the host scene under the UI (Direct mode).
     bool sceneAnimate = false;  // T-343: --scene-animate: the scene scrolls 1 px per frame.
@@ -930,6 +946,35 @@ bool parseArgs(int argc, char** argv, Args& out) {
             return true;  // Nothing else matters; main() prints the usage and exits 0.
         } else if (arg == "--headless") {
             out.headless = true;
+        } else if (arg == "--layers") {  // T-701
+            if (!needValue("--layers", out.layersDir)) {
+                return false;
+            }
+        } else if (arg == "--layers-view") {
+            out.layersView = true;
+        } else if (arg == "--layers-yaw" || arg == "--layers-pitch" || arg == "--layers-depth" ||
+                   arg == "--layers-density") {
+            const std::string flag = arg;
+            std::string v;
+            if (!needValue(flag.c_str(), v)) {
+                return false;
+            }
+            float value = 0.0f;
+            const auto parsed = xt::fromChars(v.data(), v.data() + v.size(), value);
+            if (parsed.ec != std::errc() || parsed.ptr != v.data() + v.size() || !std::isfinite(value)) {
+                std::fprintf(stderr, "xtframe-view: %s: expected a number, got '%s'\n", flag.c_str(),
+                             v.c_str());
+                return false;
+            }
+            if (flag == "--layers-yaw") {
+                out.layerOptions.yawDeg = std::clamp(value, -85.0f, 85.0f);
+            } else if (flag == "--layers-pitch") {
+                out.layerOptions.pitchDeg = std::clamp(value, -70.0f, 70.0f);
+            } else if (flag == "--layers-depth") {
+                out.layerOptions.depthScale = std::clamp(value, 0.0f, 12.0f);
+            } else {
+                out.layerOptions.density = std::clamp(value, 0.0f, 8.0f);
+            }
         } else if (arg == "--renderer") {
             if (!needValue("--renderer", out.renderer)) {
                 return false;
@@ -1566,6 +1611,13 @@ void printUsage(std::FILE* out) {
         "  --project DIR           same as the input DIR (a UI Project or Bundle), plus every\n"
         "                          other UI, their flows and the global flow\n"
         "  --headless              no window/GL context; software-render --frames frames\n"
+        "  --layers DIR            world-layer output (33): each `world-layer: on` element is drawn\n"
+        "                          into its own texture; writes layer-<order>-<id>.png, layers.json\n"
+        "                          (also printed) and preview.png into DIR; headless, on wgpu / gl\n"
+        "  --layers-view           a window showing the layers standing in space: right-drag turns\n"
+        "                          the camera, the wheel changes the depth scale\n"
+        "  --layers-yaw DEG, --layers-pitch DEG, --layers-depth S, --layers-density D\n"
+        "                          the layers view's camera, depth scale and texels per px\n"
         "  --renderer sw|gl|wgpu   the renderer (built in: see --version; default: sw with\n"
         "                          --headless, else the shell's);\n"
         "                          with --headless gl / wgpu render offscreen on the GPU\n"
@@ -2029,8 +2081,19 @@ bool loadInto(xt::Context& ctx, const std::string& path, const std::string& root
     }
 
     if (!result.ok()) {
-        std::fprintf(stderr, "xtframe-view: failed to load '%s' (%s)\n", path.c_str(),
-                     xt::statusName(result.status()));
+        // T-702: the validator's reason after the status (IrView::openError(); empty when the IR
+        // itself passes and the Document failed later).
+        std::string why;
+        if (result.status() == xt::Status::kInvalidIr) {
+            std::vector<uint8_t> bytes = compiled;
+            if (bytes.empty()) {
+                std::ifstream in(inputPath, std::ios::binary);
+                bytes.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+            }
+            why = xt::IrView::openError(xt::IrBlob{bytes.data(), bytes.size()});
+        }
+        std::fprintf(stderr, "xtframe-view: failed to load '%s' (%s%s%s)\n", path.c_str(),
+                     xt::statusName(result.status()), why.empty() ? "" : ": ", why.c_str());
         return false;
     }
 
@@ -2686,6 +2749,15 @@ int main(int argc, char** argv) {
         std::printf("renderers: %s\n", xt::view::builtRenderers().c_str());  // T-439
         return 0;
     }
+    if (!args.layersDir.empty() || args.layersView) {
+        // T-701: --layers alone is a headless run; the layers are drawn on a GPU renderer.
+        if (!args.layersView) {
+            args.headless = true;
+        }
+        if (args.renderer.empty()) {
+            args.renderer = xt::view::builtRenderers().find("wgpu") != std::string::npos ? "wgpu" : "gl";
+        }
+    }
     if (args.listFonts) {
         // T-426: the families addSystemFonts() registers, sorted and deduplicated (byte order).
         // T-429: by default each one with the file it came from, `family<TAB>path`.
@@ -2760,9 +2832,11 @@ int main(int argc, char** argv) {
     // T-439: --renderer. A renderer other than the shell's (windowed) or other than xt_sw
     // (headless) draws the frame loop below through a FrameTarget; when it cannot be created the
     // run goes on with the default path.
+    // T-701: the layers view always draws through a FrameTarget on a GPU renderer.
+    const bool layersMode = !args.layersDir.empty() || args.layersView;
     const xt::view::Renderer chosenRenderer = xt::view::resolveRenderer(args.renderer, args.headless);
     std::unique_ptr<xt::view::FrameTarget> frameTarget;
-    if (chosenRenderer != xt::view::defaultRenderer(args.headless)) {
+    if (chosenRenderer != xt::view::defaultRenderer(args.headless) || layersMode) {
         if (!args.scene.empty() || args.showDamage) {
             std::fprintf(stderr,
                          "xtframe-view: --scene / --show-damage use the default renderer path; "
@@ -2778,6 +2852,9 @@ int main(int argc, char** argv) {
             config.title = "XTFrame";
             config.clear = args.headless ? (args.transparent ? xt::Color{0, 0, 0, 0} : xt::Color{1, 1, 1, 1})
                                          : xt::Color{0.1f, 0.1f, 0.1f, 1.0f};  // the shell's background
+            if (layersMode && !args.transparent) {
+                config.clear = xt::Color{0.055f, 0.065f, 0.085f, 1.0f};  // T-701: the layers view's backdrop
+            }
             std::string error;
             frameTarget = xt::view::createFrameTarget(chosenRenderer, config, error);
             if (!frameTarget) {
@@ -2788,6 +2865,10 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "xtframe-view: renderer %s\n", frameTarget->description().c_str());
             }
         }
+    }
+    if (layersMode && (!frameTarget || !frameTarget->supportsLayers())) {
+        std::fprintf(stderr, "xtframe-view: --layers / --layers-view need the gl or wgpu renderer\n");
+        return 1;
     }
     if (args.headless || frameTarget) {
         if (!args.secondWindow.empty()) {
@@ -2819,6 +2900,14 @@ int main(int argc, char** argv) {
         // T-191 (25.3.5b): no decoder here -- an unbound <video>/<external> shows its placeholder.
         ctx.setExternalPlaceholders(true);
         ctx.setBoxShadowCommands(!args.noBoxShadow);  // T-680
+        ctx.setWorldLayerOutput(layersMode);          // T-701 (33)
+        xt::view::LayerOrbit layerOrbit(args.layerOptions);
+        std::vector<xt::view::LayerRedraws> layerRedraws;
+        if (args.layersView && !args.headless) {
+            std::fprintf(stderr,
+                         "xtframe-view: layers view: drag with the right button to turn the "
+                         "camera, wheel = depth scale\n");
+        }
         if (!bindExternalTextures(args, assets, /*upload=*/false)) {
             return 1;
         }
@@ -2967,6 +3056,10 @@ int main(int argc, char** argv) {
                     frameCount = frame;
                     break;
                 }
+                if (layersMode) {
+                    // T-701: the pointer through the viewer's camera; right-drag and wheel are its own.
+                    layerOrbit.filterInput(ctx, list.viewport.w, list.viewport.h);
+                }
                 const double now = frameTarget->seconds();
                 frameDt = frame == 0                 ? 0.0f
                           : !args.screenshot.empty() ? args.warmupDt
@@ -2995,7 +3088,25 @@ int main(int argc, char** argv) {
             }
             const xt::Document* doc = ctx.document(handle);
             const xt::IrView* irView = doc != nullptr ? &doc->ir() : nullptr;
-            if (frameTarget) {
+            if (frameTarget && layersMode) {
+                // T-701 (33): each changed layer into its own texture, then the layers as quads
+                // through the viewer's camera.
+                std::string layerError;
+                if (!frameTarget->renderLayers(list, &shaper, &assets, irView, &ctx.perf(),
+                                               layerOrbit.options().density, layerError)) {
+                    std::fprintf(stderr, "xtframe-view: world layers: %s\n", layerError.c_str());
+                    return 1;
+                }
+                xt::view::countLayerRedraws(*frameTarget, layerRedraws);
+                int frameW = 0, frameH = 0;
+                frameTarget->frameSize(frameW, frameH);
+                frameTarget->drawLayers(
+                    layerOrbit.boxToSurface(list.viewport.w, list.viewport.h, frameW, frameH));
+                const bool keepForShot = windowLoop && !args.screenshot.empty() && frame + 1 == frameCount;
+                if (!keepForShot && !(frame + 1 == frameCount && !args.layersDir.empty())) {
+                    frameTarget->present();
+                }
+            } else if (frameTarget) {
                 // T-439: gl / wgpu (or windowed sw) instead of the xt_sw buffer.
                 frameTarget->render(list, &shaper, &assets, irView, &ctx.perf(),
                                     trackDamage ? &damage : nullptr);
@@ -3042,6 +3153,25 @@ int main(int argc, char** argv) {
             printPerfSummary(ctx.perf().summary(frameCount),
                              frameCount > 0 ? 100.0f * damageAreaSum / static_cast<float>(frameCount) : 0.0f);
             gpuTotals.print(xt::view::rendererName(chosenRenderer));
+        }
+        if (!args.layersDir.empty() && frameTarget) {
+            // T-701: the layers and their list, and the last frame of the layers view.
+            if (!xt::view::dumpLayers(*frameTarget, ctx.document(handle), args.layersDir, list.viewport,
+                                      frameCount, layerRedraws)) {
+                return 1;
+            }
+            std::vector<uint8_t> preview;
+            int previewW = 0, previewH = 0;
+            if (frameTarget->read(preview, previewW, previewH)) {
+                const std::string previewPath =
+                    pathToUtf8(pathFromUtf8(args.layersDir) / pathFromUtf8("preview.png"));
+                if (!writeScreenshot(previewPath, preview.data(), previewW, previewH, previewW * 4)) {
+                    return 1;
+                }
+            }
+            if (windowLoop || args.screenshot.empty()) {
+                frameTarget->present();
+            }
         }
         // T-125: --screenshot works headless too -- the software buffer above already holds the
         // last frame, so nothing needs a GL context. T-439: a FrameTarget is read back instead.

@@ -154,6 +154,35 @@ const char* GlRenderer::lastError() const { return m_impl->lastError.c_str(); }
 
 bool GlRenderer::wantsAnotherFrame() const { return m_impl->builder.wantsAnotherFrame(); }
 
+gpu::GpuDevice* GlRenderer::device() { return m_impl->initialized ? &m_impl->device : nullptr; }
+
+void GlRenderer::submitFrame(const gpu::GpuFrame& frame) {
+    Impl& impl = *m_impl;
+    impl.lastError.clear();
+    if (!impl.initialized) {
+        impl.lastError = "GlRenderer::init was not called";
+        return;
+    }
+    // As render(): the host's state is saved, the bound FBO is the surface.
+    GlSavedState saved = saveState();
+    glActiveTexture(GL_TEXTURE0);
+    unbindSamplers();
+    setUploadUnpackState();
+    GLint boundFbo = 0;
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &boundFbo);
+    impl.device.setSurface(static_cast<GLuint>(boundFbo));
+    impl.device.submit(frame);
+    if (!impl.device.lastError().empty()) {
+        impl.lastError = impl.device.lastError();
+    }
+    restoreState(saved);
+}
+
+bool GlRenderer::readLayerTarget(gpu::TextureHandle target, std::vector<uint8_t>& rgba, int& width,
+                                 int& height) {
+    return m_impl->initialized && m_impl->device.readTarget(target, rgba, width, height);
+}
+
 const char* GlRenderer::lastWarning() const { return m_impl->lastWarning.c_str(); }
 
 int GlRenderer::sampleCount() const { return m_impl->samples; }

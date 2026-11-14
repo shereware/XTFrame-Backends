@@ -7,6 +7,7 @@ add_executable(xt_gl_tests
     test_gl_particles.cpp
     test_gl_mips.cpp  # T-665
     test_gl_direct.cpp
+    test_gl_world_layers.cpp  # T-701
 )
 target_include_directories(xt_gl_tests SYSTEM PRIVATE ${PROJECT_SOURCE_DIR}/Code/SDKs/doctest)
 target_compile_definitions(xt_gl_tests PRIVATE DOCTEST_CONFIG_USE_STD_HEADERS)

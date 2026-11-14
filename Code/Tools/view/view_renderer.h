@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -9,6 +10,7 @@
 #include "xt/command_list.h"
 #include "xt/context.h"
 #include "xt/damage.h"
+#include "xt/gpu/world_layers.h"
 #include "xt/ir.h"
 #include "xt/perf.h"
 #include "xt/types.h"
@@ -115,6 +117,43 @@ public:
     virtual bool gpuCounters(GpuFrameCounters& out) {
         (void)out;
         return false;
+    }
+
+    // -- T-701 (Docs/design/33-world-layers.md): world layers, on the GPU renderers. --
+
+    /// True when the target can draw a list painted in world-layer output layer by layer.
+    virtual bool supportsLayers() const { return false; }
+    /// Builds and draws the changed layers of `list` into their own textures (gpu::
+    /// WorldLayerBuilder), at `density` texels per logical px (0: the list's pixel ratio). False
+    /// and `error` when the list has no layers or the device no layer targets.
+    virtual bool renderLayers(const CommandList& list, TextShaper* shaper, AssetResolver* assets,
+                              const IrView* ir, PerfTracker* perf, float density, std::string& error) {
+        (void)list;
+        (void)shaper;
+        (void)assets;
+        (void)ir;
+        (void)perf;
+        (void)density;
+        error = "this renderer has no world layers";
+        return false;
+    }
+    /// The layers of the last renderLayers().
+    virtual std::span<const gpu::WorldLayer> layers() const { return {}; }
+    /// What the last renderLayers() did.
+    virtual gpu::WorldLayerBuilder::Stats layerStats() const { return {}; }
+    /// One layer's texture as straight-alpha RGBA8, row 0 = top (`layer.texWidth` x `texHeight`).
+    virtual bool readLayer(const gpu::WorldLayer& layer, std::vector<uint8_t>& rgba) {
+        (void)layer;
+        (void)rgba;
+        return false;
+    }
+    /// Clears the frame and draws the layers as quads (gpu::buildWorldLayerQuads): `boxToSurface`
+    /// maps a root-box point to homogeneous pixels of the frame. read() / present() as after render().
+    virtual void drawLayers(const Mat4& boxToSurface) { (void)boxToSurface; }
+    /// The frame's size in pixels (what drawLayers' matrix addresses).
+    virtual void frameSize(int& width, int& height) const {
+        width = 0;
+        height = 0;
     }
 };
 

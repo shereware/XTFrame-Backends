@@ -118,7 +118,7 @@ void WgpuDevice::drawCmd(WGPURenderPassEncoder pass, const gpu::DrawCmd& cmd, ui
     // Target attachments of the open pass.
     WGPUTextureFormat format = m_targetFormat;
     uint32_t samples = m_sampleCount;
-    bool hasStencil = true;
+    bool hasStencil = surfaceStencilView() != nullptr;  // T-703: a layer target may have none
     if (target != gpu::kSurfaceTarget) {
         const Pooled& p = pool()[static_cast<size_t>(m_frameTargets[target - 1])];
         format = detail::formatOf(p.format);

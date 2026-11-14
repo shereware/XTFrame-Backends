@@ -55,6 +55,7 @@ add_custom_command(
 add_library(xt_wgpu STATIC
     src/wgpu_init.cpp
     src/wgpu_device.cpp
+    src/wgpu_layers.cpp  # T-701: world-layer targets
     src/wgpu_mips.cpp  # T-665
     src/wgpu_draw.cpp
     src/wgpu_pipelines.cpp
