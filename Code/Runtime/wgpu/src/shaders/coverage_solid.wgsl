@@ -3,5 +3,5 @@
 // Mirrors gl_shaders.h kCoverageSolidFrag.
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4f {
-    return in.color * tex0(in.uv).r;
+    return in.color * tex0(in.uv).r * clipCoverage(in.px);  // T-718: 1 without an analytic clip
 }

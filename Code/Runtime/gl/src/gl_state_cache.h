@@ -143,6 +143,8 @@ public:
     void setMat3(GLint loc, const float* m9);
     void setMat4(GLint loc, const float* m16);
     void set1fv(GLint loc, int count, const float* v);
+    /// T-719: `count` vec4 (a `uniform vec4 name[count]`).
+    void set4fv(GLint loc, int count, const float* v);
 
     /// Where to count issued glUniform* calls (may stay null).
     GlDeviceStats* stats = nullptr;

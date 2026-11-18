@@ -347,7 +347,8 @@ public:
 #endif
     std::string description() const override {
         return std::string("wgpu ") + (m_windowed ? "(sdl2 window, " : "(offscreen, ") +
-               m_renderer.adapterName() + ")";
+               m_renderer.adapterName() + (xt::wgpu::labelsEnabled() ? ", labels on" : ", labels off") +
+               ")";  // T-726: XT_WGPU_LABELS
     }
     ~WgpuTarget() override { m_layers.end(); }  // before the renderer (its device) goes
     bool supportsLayers() const override { return true; }
@@ -408,6 +409,15 @@ public:
         out.clipScissor = s.clipScissor;
         out.clipImageDirect = s.clipImageDirect;
         out.clipMaskLayers = s.clipMaskLayers;
+        out.analyticClips = s.analyticClips;  // T-718
+        out.analyticClipFallbacks = s.analyticClipFallbacks;
+        out.effectCachePhaseHits = s.effectCachePhaseHits;  // T-721
+        out.effectCacheSettles = s.effectCacheSettles;
+        out.backdropPairHits = s.backdropPairHits;  // T-730
+        out.backdropPairMisses = s.backdropPairMisses;
+        out.backdropPairStores = s.backdropPairStores;
+        out.effectCacheBytes = s.effectCacheBytes;
+        out.effectCacheEntries = s.effectCacheEntries;
         out.buildMs = s.buildMs;
         out.submitMs = s.submitMs;
         out.inflightWaits = s.inflightWaits;  // T-674
@@ -416,6 +426,8 @@ public:
             out.hasBindings = true;
             out.liveBindings = device->lastStats().liveBindings;
             out.peakBindings = device->lastStats().peakBindings;
+            out.bindGroups = device->lastStats().bindGroups;  // T-726
+            out.bindGroupEvictions = device->lastStats().bindGroupEvictions;
             out.mipChains = device->mipChainsMade();  // T-665
             out.mipBytes = device->mipChainBytes();
             out.mipMs = device->mipChainMs();

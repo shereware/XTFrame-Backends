@@ -219,9 +219,9 @@ void WgpuSharedCache::Impl::destroyTransient(WgpuDevice::Pooled& p) {
         return;
     }
     stats.poolFrees += 1u + (p.resolve != nullptr ? 1u : 0u) + (p.depthStencil != nullptr ? 1u : 0u);
+    noteViewDestroyed(p.viewId);  // T-726: the devices remove the bind groups naming it
     WgpuDevice::releasePooled(p);
     p = WgpuDevice::Pooled{};
-    ++viewGeneration;
 }
 
 void WgpuSharedCache::Impl::trimCachedFree() {
@@ -233,9 +233,9 @@ void WgpuSharedCache::Impl::trimCachedFree() {
         WgpuDevice::Texture t = cachedFree[oldest].texture;
         cachedFree.erase(cachedFree.begin() + static_cast<std::ptrdiff_t>(oldest));
         cachedFreeBytes -= uint64_t(t.width) * t.height * 4u;
+        noteViewDestroyed(t.viewId);  // T-726
         WgpuDevice::releaseTextureEntry(t);
         ++stats.poolFrees;
-        ++viewGeneration;
     }
 }
 
@@ -261,7 +261,7 @@ void WgpuSharedCache::Impl::applyTransientBudget() {
         if (lru == transients.size() || transients[lru].lastUsed == frame) break;
         unprotected -= transients[lru].bytes;
         --liveCount;
-        destroyTransient(transients[lru]);  // the devices flush their bind groups by viewGeneration
+        destroyTransient(transients[lru]);  // the devices drop their bind groups by viewLog (T-726)
         ++stats.poolBudgetEvictions;
     }
 }
@@ -309,9 +309,9 @@ void WgpuSharedCache::Impl::agePools() {
             WgpuDevice::Texture t = cachedFree[i].texture;
             cachedFreeBytes -= uint64_t(t.width) * t.height * 4u;
             cachedFree.erase(cachedFree.begin() + static_cast<std::ptrdiff_t>(i));
+            noteViewDestroyed(t.viewId);  // T-726
             WgpuDevice::releaseTextureEntry(t);
             ++stats.poolFrees;
-            ++viewGeneration;
             break;
         }
     }
@@ -324,10 +324,10 @@ uint32_t WgpuSharedCache::Impl::destroyPools() {
     }
     transients.clear();
     for (WgpuDevice::FreeCached& f : cachedFree) {
+        noteViewDestroyed(f.texture.viewId);  // T-726
         WgpuDevice::releaseTextureEntry(f.texture);
         ++stats.poolFrees;
     }
-    if (!cachedFree.empty()) ++viewGeneration;
     cachedFree.clear();
     cachedFreeBytes = 0;
     for (AttachmentSet& a : attachments) {
@@ -508,6 +508,7 @@ void WgpuSharedCache::Impl::destroyImage(Image& image) {
         --stats.imageTextures;
     }
     stats.imageBytes -= image.bytes <= stats.imageBytes ? image.bytes : stats.imageBytes;
+    noteViewDestroyed(image.viewId);  // T-726: no device uses it now; logged all the same
     wgpuTextureViewRelease(image.view);
     if (image.texture != nullptr) {
         wgpuTextureDestroy(image.texture);

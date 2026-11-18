@@ -281,4 +281,9 @@ void UniformShadow::set1fv(GLint loc, int count, const float* v) {
     if (update(loc, v, static_cast<size_t>(count) * sizeof(float))) glUniform1fv(loc, count, v);
 }
 
+void UniformShadow::set4fv(GLint loc, int count, const float* v) {
+    if (count <= 0) return;
+    if (update(loc, v, static_cast<size_t>(count) * 4 * sizeof(float))) glUniform4fv(loc, count, v);
+}
+
 }  // namespace xt::gl

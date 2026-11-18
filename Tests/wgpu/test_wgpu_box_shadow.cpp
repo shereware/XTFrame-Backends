@@ -3,6 +3,7 @@
 // tolerance, and the pass count of a frame with ten shadows before (PushEffect) and after.
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "doctest.h"
@@ -135,4 +136,67 @@ TEST_CASE("wgpu box shadow: three-term (outlined) shadows are one pass and match
         CHECK(s.renderer.stats().passes == 1u);
         CHECK(matches(gpu, renderSw(cl, kW, kH), kW, kH, "three-term box shadows"));
     }
+}
+
+// T-716 (Docs/design/10-backends.md §10.16 W3, §10.15 item 4): the shadows of boxes on a `perspective`
+// root's own plane are painted as DrawBoxShadow, so the frame is one pass and its pixels are those of
+// the same document without the root; on the planes of a 3D space the result still matches xt::sw.
+namespace {
+
+const golden::UiFixture& uiFixture(const std::vector<golden::UiFixture>& all, const char* name) {
+    const golden::UiFixture* found = nullptr;
+    for (const golden::UiFixture& f : all) {
+        found = f.name == name ? &f : found;
+    }
+    REQUIRE(found != nullptr);
+    return *found;
+}
+
+/// Draws a UI fixture on a fresh wgpu renderer; `passes` receives the frame's render pass count.
+std::vector<uint8_t> drawUiFixture(const golden::UiFixture& fx, uint32_t& passes) {
+    const std::string uiDir = XT_GOLDEN_UI_DIR;
+    return golden::renderUiFixture(fx, uiDir,
+                                   [&](const golden::UiFixture& f, const CommandList& cmds, TextShaper*,
+                                       AssetResolver* assets, const IrView* ir) {
+                                       Session s(f.width, f.height);
+                                       std::vector<uint8_t> px = s.render(cmds, f.clearColor, assets, ir);
+                                       CHECK_MESSAGE(s.error.empty(), s.error);
+                                       passes = s.renderer.stats().passes;
+                                       return px;
+                                   });
+}
+
+}  // namespace
+
+TEST_CASE("wgpu box shadow: shadows on a perspective root's own plane draw as without the root (T-716)") {
+    const std::string uiDir = XT_GOLDEN_UI_DIR;
+    const std::vector<golden::UiFixture> all = golden::loadUiManifest(uiDir + "/manifest.txt");
+    const golden::UiFixture& flat = uiFixture(all, "ui_box_shadow_flat");
+    const golden::UiFixture& persp = uiFixture(all, "ui_box_shadow_persp");
+    uint32_t passesFlat = 0, passesPersp = 0;
+    const std::vector<uint8_t> pxFlat = drawUiFixture(flat, passesFlat);
+    const std::vector<uint8_t> pxPersp = drawUiFixture(persp, passesPersp);
+    REQUIRE(!pxFlat.empty());
+    REQUIRE(pxFlat.size() == pxPersp.size());
+    CHECK(passesFlat == 1u);
+    CHECK(passesPersp == 1u);  // no offscreen shadow chain
+    const golden::GoldenResult r =
+        golden::compareRgba(pxPersp.data(), pxFlat.data(), flat.width, flat.height, 0, 0.0f);
+    MESSAGE("perspective root vs none: " << r.diffPixels << " px differ, max channel diff "
+                                         << r.maxChannelDiff);
+    CHECK(r.diffPixels == 0u);
+    CHECK(matches(pxPersp, golden::renderUiFixture(persp, uiDir), persp.width, persp.height,
+                  "ui_box_shadow_persp"));
+}
+
+TEST_CASE("wgpu box shadow: shadows on the planes of a 3D space match SW (T-716)") {
+    const std::string uiDir = XT_GOLDEN_UI_DIR;
+    const std::vector<golden::UiFixture> all = golden::loadUiManifest(uiDir + "/manifest.txt");
+    const golden::UiFixture& planes = uiFixture(all, "ui_box_shadow_planes");
+    uint32_t passes = 0;
+    const std::vector<uint8_t> px = drawUiFixture(planes, passes);
+    REQUIRE(!px.empty());
+    MESSAGE("ui_box_shadow_planes: " << passes << " passes");
+    CHECK(matches(px, golden::renderUiFixture(planes, uiDir), planes.width, planes.height,
+                  "ui_box_shadow_planes"));
 }

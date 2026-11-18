@@ -37,7 +37,7 @@ public:
               GLuint lutTex, const float* ndc9, GlStateCache& cache);
 
 private:
-    static constexpr int kProgramCount = 17;  // T-343: + Downsample, Kawase, LevelMix
+    static constexpr int kProgramCount = 18;  // T-343: + Downsample, Kawase, LevelMix; T-729: BackdropMasked
 
     /// Every uniform name any effect shader declares; a program's `locs` holds -1 for the ones
     /// it does not have.
@@ -80,6 +80,7 @@ private:
         uSrcSize,  // T-343
         uDstSize,
         uMix,
+        uChannel,  // T-728
         kUniformCount
     };
     struct Program {

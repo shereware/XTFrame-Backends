@@ -1749,3 +1749,59 @@ TEST_CASE("gl golden: ui_3d_flip_0 / 90 / 180 match the SW expected images") {
     checkGlMatchesSwGolden("ui_3d_flip_90", 16, 0.03f);
     checkGlMatchesSwGolden("ui_3d_flip_180", 16, 0.03f);
 }
+
+// T-716 (Docs/design/10-backends.md §10.16 W3, §10.15 item 4): the shadows of boxes on a `perspective`
+// root's own plane are DrawBoxShadow commands, so GL draws the same pixels as for the same document
+// without the root; the planes of a 3D space (own plane, translateZ, rotateX, an element's own
+// translateZ) match the SW expected image.
+namespace {
+
+std::vector<uint8_t> renderGlUiFixture(const char* name) {
+    const std::string uiDir = XT_GOLDEN_UI_DIR;
+    const std::vector<golden::UiFixture> fixtures = golden::loadUiManifest(uiDir + "/manifest.txt");
+    REQUIRE(golden::manifestErrors() == 0);
+    const golden::UiFixture* found = nullptr;
+    for (const golden::UiFixture& fx : fixtures) {
+        found = fx.name == name ? &fx : found;
+    }
+    REQUIRE(found != nullptr);
+    return golden::renderUiFixture(
+        *found, uiDir,
+        [&](const golden::UiFixture& f, const CommandList& cmds, TextShaper* shaper, AssetResolver* assets,
+            const IrView* ir) {
+            GlSession gl(f.width, f.height);
+            gl.target.bindAndClear(f.clearColor);
+            gl.renderer.render(cmds, shaper, assets, ir);
+            return gl.target.readback();  // bottom-up; only compared with another such image
+        });
+}
+
+}  // namespace
+
+TEST_CASE("gl golden: ui_box_shadow_persp equals ui_box_shadow_flat pixel for pixel (T-716)") {
+    const std::vector<uint8_t> flat = renderGlUiFixture("ui_box_shadow_flat");
+    const std::vector<uint8_t> persp = renderGlUiFixture("ui_box_shadow_persp");
+    REQUIRE(!flat.empty());
+    REQUIRE(flat.size() == persp.size());
+    const golden::GoldenResult r = golden::compareRgba(persp.data(), flat.data(), 256, 340, 0, 0.0f);
+    MESSAGE("perspective root vs none: " << r.diffPixels << " px differ, max channel diff "
+                                         << r.maxChannelDiff);
+    CHECK(r.diffPixels == 0u);
+}
+
+TEST_CASE("gl golden: ui_box_shadow_flat / planes match the SW expected images (T-716)") {
+    checkGlMatchesSwGolden("ui_box_shadow_flat", 16, 0.03f);
+    checkGlMatchesSwGolden("ui_box_shadow_planes", 16, 0.03f);
+}
+
+TEST_CASE("gl golden: ui_plane_2d_persp equals ui_plane_2d_wrapped pixel for pixel (T-725)") {
+    const std::vector<uint8_t> wrapped = renderGlUiFixture("ui_plane_2d_wrapped");
+    const std::vector<uint8_t> persp = renderGlUiFixture("ui_plane_2d_persp");
+    REQUIRE(!wrapped.empty());
+    REQUIRE(wrapped.size() == persp.size());
+    const golden::GoldenResult r = golden::compareRgba(persp.data(), wrapped.data(), 256, 256, 0, 0.0f);
+    MESSAGE("perspective root vs perspective around the tilted plane only: "
+            << r.diffPixels << " px differ, max channel diff " << r.maxChannelDiff);
+    CHECK(r.diffPixels == 0u);
+    checkGlMatchesSwGolden("ui_plane_2d_wrapped", 16, 0.03f);
+}

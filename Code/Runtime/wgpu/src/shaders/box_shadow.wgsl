@@ -6,5 +6,5 @@
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4f {
     let coverage = bsCoverage(0u, in.uv, pf(8u));
-    return vec4f(pf(12u), pf(13u), pf(14u), pf(15u)) * coverage;
+    return vec4f(pf(12u), pf(13u), pf(14u), pf(15u)) * coverage * clipCoverage(in.px);  // T-718
 }

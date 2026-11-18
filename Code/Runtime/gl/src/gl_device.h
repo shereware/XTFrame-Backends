@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <utility>
 #include <vector>
@@ -108,6 +109,12 @@ public:
     /// T-691 (§10.14): coverage quads (T-660b) and Shading::BoxShadow (T-668) are implemented.
     bool supportsCoverageDraws() const override { return true; }
     bool supportsBoxShadowShading() const override { return true; }
+    /// T-719 (§10.16 W1): every leaf program multiplies by the command's AnalyticClipParams coverage.
+    bool supportsAnalyticClip() const override { return true; }
+    /// T-728 (§10.18 A item 1): kFxDownsampleFrag / kFxGaussScalarFrag read the params' `channel`.
+    bool supportsAlphaChannelReads() const override { return true; }
+    /// T-729 (§10.18 B): kFxBackdropMaskedFrag takes the content as its third input (unit 2).
+    bool supportsBackdropMask() const override { return true; }
     /// T-263d: GL_MAX_TEXTURE_SIZE as init() read it (0 before init or when the driver gave none).
     uint32_t maxTextureSize() const override {
         return m_maxTextureSize > 0 ? static_cast<uint32_t>(m_maxTextureSize) : 0;
@@ -155,6 +162,8 @@ private:
         GLint uShape1 = -1, uRadii1 = -1, uShape2 = -1, uRadii2 = -1, uTerms = -1;
         // T-665: kTextureLodFrag's lod, last level and straight flag.
         GLint uLodParams = -1;
+        // T-719: the leaf programs' analytic clip block (XT_GL_ANALYTIC_CLIP_COMMON).
+        GLint uClipCount = -1, uClip = -1;
         UniformShadow shadow;
     };
     Program m_solid, m_gradient, m_texture, m_textureStraight, m_glyph, m_composite, m_resolve;
@@ -171,6 +180,7 @@ private:
     struct ParticleProgram {
         GLuint id = 0;
         GLint uNdc = -1, uXf = -1, uStraight = -1;
+        GLint uClipCount = -1, uClip = -1;  // T-719
         UniformShadow shadow;
     };
     ParticleProgram m_particleTexture, m_particleSolid;
@@ -269,6 +279,12 @@ private:
     float m_scaleX = 1.0f, m_scaleY = 1.0f;
 
     bool linkMain(Program& p, const char* frag, std::string& err);
+    /// T-719: makes the leaf program `prog` (a Program or a ParticleProgram) current for `cmd`: its
+    /// `uNdc`, and the analytic clip block at `DrawCmd::clipParamIndex` (count 0 without one; the
+    /// uniforms are only sent when they differ from the program's last ones). False when the block
+    /// lies outside the frame's parameters: the command is not drawn (as xt_wgpu).
+    template <typename P>
+    bool useLeaf(P& prog, const gpu::DrawCmd& cmd);
 
     /// `target`'s window on the surface: the whole surface for kSurfaceTarget, else the window of
     /// the last pass that drew it (or, before any pass, the full transient at (0,0)).
@@ -312,5 +328,27 @@ private:
     HostFilter m_hostFilter;
     const float* paramsAt(uint32_t index, size_t& available) const;
 };
+
+template <typename P>
+bool GlDevice::useLeaf(P& prog, const gpu::DrawCmd& cmd) {
+    m_cache.useProgram(prog.id);
+    prog.shadow.stats = &m_cache.stats;
+    prog.shadow.setMat3(prog.uNdc, m_ndc);
+    if (cmd.clipParamIndex == 0) {
+        prog.shadow.set1i(prog.uClipCount, 0);
+        return true;
+    }
+    size_t avail = 0;
+    const float* p = paramsAt(cmd.clipParamIndex, avail);
+    if (p == nullptr || avail * sizeof(float) < sizeof(gpu::AnalyticClipParams)) {
+        return false;
+    }
+    uint32_t count = 0;  // AnalyticClipParams::count, then three words of padding and the slots
+    std::memcpy(&count, p, sizeof(count));
+    const uint32_t slots = gpu::AnalyticClipParams::kMaxSlots;
+    prog.shadow.set1i(prog.uClipCount, static_cast<GLint>(count < slots ? count : slots));
+    prog.shadow.set4fv(prog.uClip, static_cast<int>(slots * 4), p + 4);
+    return true;
+}
 
 }  // namespace xt::gl

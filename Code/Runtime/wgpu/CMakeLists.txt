@@ -35,6 +35,7 @@ set(XT_WGSL_SOURCES
     src/shaders/fx_downsample.wgsl
     src/shaders/fx_kawase.wgsl
     src/shaders/fx_level_mix.wgsl
+    src/shaders/fx_backdrop_masked.wgsl  # T-729
     src/shaders/blit.wgsl
 )
 set(xt_wgsl_abs "")
@@ -64,6 +65,7 @@ add_library(xt_wgpu STATIC
     src/wgpu_renderer.cpp
     src/wgpu_shared.cpp
     src/wgpu_inflight.cpp
+    src/wgpu_timing.cpp  # T-734: GPU timestamps (diagnostics)
     src/wgpu_window.cpp
     "${xt_wgsl_header}"
 )

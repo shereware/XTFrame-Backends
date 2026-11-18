@@ -1,20 +1,132 @@
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <unordered_map>
 
 #include "wgpu_internal.h"
 #include "xt/wgpu/wgpu_device.h"
 
 /// Command encoding of WgpuDevice::submit (T-438, Docs/design/10-backends.md §10.10.2): per draw
-/// command the cached pipeline, the parameter offset (group 1), the texture bind group (group 2),
-/// the scissor (gl_device.cpp applyScissor in top-down pixels) and the stencil reference
+/// command the cached pipeline, the parameter and analytic clip offsets (group 1), the texture bind group
+/// (group 2), the scissor (gl_device.cpp applyScissor in top-down pixels) and the stencil reference
 /// (gl_device.cpp applyStencil's `ref`).
 
 namespace xt::wgpu {
 
+uint64_t detail::newViewId() {
+    static std::atomic<uint64_t> next{kDummyViewId + 1};
+    return next.fetch_add(1, std::memory_order_relaxed);
+}
+
+namespace {
+
+/// T-670: the non-sampler bindings of a cached group of `key` (a blit group: the uniform buffer and
+/// one view; a texture group: three views).
+uint32_t bindingsOf(const detail::BindGroupKey& key, WGPUBindGroupLayout blitLayout) {
+    return key.layout == blitLayout ? 2u : 3u;
+}
+
+}  // namespace
+
+void WgpuDevice::Gpu::eraseCached(
+    std::unordered_map<detail::BindGroupKey, WGPUBindGroup, detail::BindGroupKeyHash>::iterator it,
+    uint64_t skipId) {
+    const detail::BindGroupKey key = it->first;
+    wgpuBindGroupRelease(it->second);
+    cachedBindings -= std::min(cachedBindings, bindingsOf(key, pipelines->blitLayout()));
+    bindGroups.erase(it);
+    const uint64_t ids[3] = {key.id0, key.id1, key.id2};
+    for (int i = 0; i < 3; ++i) {
+        const uint64_t id = ids[i];
+        if (id == skipId || id == detail::kDummyViewId || (i > 0 && id == ids[0]) ||
+            (i > 1 && id == ids[1])) {
+            continue;
+        }
+        auto list = keysByView.find(id);
+        if (list == keysByView.end()) continue;
+        std::vector<detail::BindGroupKey>& keys = list->second;
+        for (size_t k = 0; k < keys.size(); ++k) {
+            if (keys[k] == key) {
+                keys[k] = keys.back();
+                keys.pop_back();
+                break;
+            }
+        }
+        if (keys.empty()) keysByView.erase(list);
+    }
+}
+
+uint32_t WgpuDevice::Gpu::evictView(uint64_t id) {
+    auto list = keysByView.find(id);
+    if (list == keysByView.end()) {
+        return 0;
+    }
+    const std::vector<detail::BindGroupKey> keys = std::move(list->second);
+    keysByView.erase(list);
+    uint32_t n = 0;
+    for (const detail::BindGroupKey& key : keys) {
+        auto it = bindGroups.find(key);
+        if (it == bindGroups.end()) continue;
+        eraseCached(it, id);
+        ++n;
+    }
+    return n;
+}
+
+uint32_t WgpuDevice::Gpu::evictLayout(WGPUBindGroupLayout layout) {
+    std::vector<detail::BindGroupKey> keys;
+    for (const auto& kv : bindGroups) {
+        if (kv.first.layout == layout) keys.push_back(kv.first);
+    }
+    for (const detail::BindGroupKey& key : keys) {
+        eraseCached(bindGroups.find(key), 0);
+    }
+    return static_cast<uint32_t>(keys.size());
+}
+
+void WgpuDevice::forgetView(uint64_t id, bool shared) {
+    if (id == 0) {
+        return;
+    }
+    if (m_gpu) m_evictedBindGroups += m_gpu->evictView(id);
+    if (shared && m_sharing != nullptr) {
+        syncSharedViews();  // what the others logged before this one
+        WgpuSharedCache::Impl& c = *m_sharing->m_impl;
+        c.noteViewDestroyed(id);
+        m_seenViewGeneration = c.viewGeneration;  // this device's own groups are gone already
+    }
+}
+
+void WgpuDevice::syncSharedViews() {
+    if (m_sharing == nullptr) {
+        return;
+    }
+    WgpuSharedCache::Impl& c = *m_sharing->m_impl;
+    if (m_seenViewGeneration == c.viewGeneration) {
+        return;
+    }
+    const uint64_t first = c.viewGeneration - c.viewLog.size();  // the generation of viewLog[0]
+    if (m_gpu) {
+        if (m_seenViewGeneration < first) {
+            m_evictedBindGroups += static_cast<uint32_t>(m_gpu->bindGroups.size());  // the log moved on
+            m_gpu->releaseBindGroups();
+        } else {
+            for (size_t i = static_cast<size_t>(m_seenViewGeneration - first); i < c.viewLog.size(); ++i) {
+                m_evictedBindGroups += m_gpu->evictView(c.viewLog[i]);
+            }
+        }
+    }
+    m_seenViewGeneration = c.viewGeneration;
+}
+
 WGPUBindGroup WgpuDevice::Gpu::bindGroup(WGPUDevice device, const detail::BindGroupKey& key,
                                          uint32_t& creates, bool perFrame) {
+    // T-726: a key naming a view without an id (none should) is made for this submit only.
+    if (key.id0 == 0 || (key.v1 != nullptr && key.id1 == 0) || (key.v2 != nullptr && key.id2 == 0)) {
+        perFrame = true;
+    }
     if (!perFrame) {
         auto it = bindGroups.find(key);
         if (it != bindGroups.end()) {
@@ -25,6 +137,7 @@ WGPUBindGroup WgpuDevice::Gpu::bindGroup(WGPUDevice device, const detail::BindGr
                 wgpuBindGroupRelease(kv.second);
             }
             bindGroups.clear();
+            keysByView.clear();  // T-726
             cachedBindings = 0;  // T-670
         }
     }
@@ -63,12 +176,53 @@ WGPUBindGroup WgpuDevice::Gpu::bindGroup(WGPUDevice device, const detail::BindGr
         frameBindGroups.push_back(bg);
     } else {
         bindGroups.emplace(key, bg);
+        const uint64_t ids[3] = {key.id0, key.id1, key.id2};  // T-726: indexed by each distinct id
+        for (int i = 0; i < 3; ++i) {
+            const uint64_t id = ids[i];
+            if (id == 0 || id == detail::kDummyViewId || (i > 0 && id == ids[0]) || (i > 1 && id == ids[1])) {
+                continue;
+            }
+            keysByView[id].push_back(key);
+        }
     }
     return bg;
 }
 
-void WgpuDevice::blit(WGPURenderPassEncoder pass, WGPUTextureView src, uint32_t uniformOffset, int x, int y,
-                      int w, int h, WGPUTextureFormat format, uint32_t samples, bool hasStencil,
+void WgpuDevice::planClipBlocks(const gpu::GpuFrame& frame) {
+    m_cmdClipOffsets.assign(frame.cmds.size(), 0);
+    const size_t clipFloats = detail::kClipBlockBytes / sizeof(float);
+    const size_t slotFloats = detail::kUniformAlign / sizeof(float);  // one 256-byte step holds a block
+    static_assert(detail::kClipBlockBytes <= detail::kUniformAlign, "a clip block is one aligned step");
+    uint32_t lastIndex = 0, lastOffset = 0;
+    std::unordered_map<uint32_t, uint32_t> byIndex;
+    for (size_t c = 0; c < frame.cmds.size(); ++c) {
+        const uint32_t index = frame.cmds[c].clipParamIndex;
+        if (index == 0) {
+            continue;  // offset 0: the zero block (count 0)
+        }
+        if (index == lastIndex) {
+            m_cmdClipOffsets[c] = lastOffset;
+            continue;
+        }
+        auto it = byIndex.find(index);
+        if (it == byIndex.end()) {
+            if (static_cast<size_t>(index) + clipFloats > frame.params.size()) {
+                m_cmdParamOffsets[c] = kNoParams;  // a block outside the pool: the command is not drawn
+                continue;
+            }
+            const uint32_t offset = static_cast<uint32_t>(m_uniformData.size() * sizeof(float));
+            m_uniformData.resize(m_uniformData.size() + slotFloats, 0.0f);
+            std::memcpy(&m_uniformData[offset / 4], frame.params.data() + index, detail::kClipBlockBytes);
+            it = byIndex.emplace(index, offset).first;
+        }
+        lastIndex = index;
+        lastOffset = it->second;
+        m_cmdClipOffsets[c] = lastOffset;
+    }
+}
+
+void WgpuDevice::blit(WGPURenderPassEncoder pass, WGPUTextureView src, uint64_t srcId, uint32_t uniformOffset,
+                      int x, int y, int w, int h, WGPUTextureFormat format, uint32_t samples, bool hasStencil,
                       uint32_t targetW, uint32_t targetH) {
     Gpu& g = *m_gpu;
     WGPURenderPipeline p = g.pipelines->blit(format, samples, hasStencil);
@@ -83,6 +237,7 @@ void WgpuDevice::blit(WGPURenderPassEncoder pass, WGPUTextureView src, uint32_t 
     detail::BindGroupKey key;
     key.layout = g.pipelines->blitLayout();
     key.v0 = src;
+    key.id0 = src == m_surface ? 0 : srcId;  // T-726: the surface view's group is this submit's only
     WGPUBindGroup bg = g.bindGroup(m_device, key, m_stats.bindGroups, src == m_surface);
     wgpuRenderPassEncoderSetPipeline(pass, p);
     wgpuRenderPassEncoderSetBindGroup(pass, 0, bg, 1, &uniformOffset);
@@ -232,39 +387,54 @@ void WgpuDevice::drawCmd(WGPURenderPassEncoder pass, const gpu::DrawCmd& cmd, ui
     detail::BindGroupKey bk;
     bk.layout = g.pipelines->textureLayout(shader);
     bk.v0 = bk.v1 = bk.v2 = g.dummyView;
+    bk.id0 = bk.id1 = bk.id2 = detail::kDummyViewId;  // T-726
     bk.sampler = g.pipelines->sampler(gpu::Sampler::LinearClamp);
-    auto textureView = [this, &g](gpu::TextureHandle h) {
+    // T-726: each slot gets the view and its id.
+    auto textureView = [this, &g](gpu::TextureHandle h, WGPUTextureView& v, uint64_t& id) {
         const Texture* t = find(h);
-        return t != nullptr ? viewOf(*t) : g.dummyView;  // T-665: a shared image's current view
+        if (t == nullptr) {
+            v = g.dummyView;
+            id = detail::kDummyViewId;
+            return;
+        }
+        v = viewOf(*t);  // T-665: a shared image's current view
+        id = viewIdOf(*t);
     };
-    auto targetView = [this, &g](gpu::TargetHandle t) {
-        WGPUTextureView v = sampleView(t);
-        return (t != gpu::kSurfaceTarget && v != nullptr) ? v : g.dummyView;
+    auto targetView = [this, &g](gpu::TargetHandle t, WGPUTextureView& v, uint64_t& id) {
+        v = sampleView(t);
+        id = sampleViewId(t);
+        if (t == gpu::kSurfaceTarget || v == nullptr) {
+            v = g.dummyView;
+            id = detail::kDummyViewId;
+        }
     };
     switch (cmd.shading) {
         case Shading::Texture:
         case Shading::TextureStraight:
         case Shading::ParticleTexture:
-            bk.v0 = textureView(cmd.texture);
+            textureView(cmd.texture, bk.v0, bk.id0);
             bk.sampler = g.pipelines->sampler(cmd.sampler);
             break;
         case Shading::Gradient:
         case Shading::Glyph:
-            bk.v0 = textureView(cmd.texture);  // gl_device.cpp: always LinearClamp
+            textureView(cmd.texture, bk.v0, bk.id0);  // gl_device.cpp: always LinearClamp
             if (cmd.shading == Shading::Gradient && cmd.coverage != 0) {
-                bk.v1 = textureView(cmd.coverage);  // T-660b: t1 = the coverage page
+                textureView(cmd.coverage, bk.v1, bk.id1);  // T-660b: t1 = the coverage page
             }
             break;
         case Shading::Solid:
             if (cmd.coverage != 0) {
-                bk.v0 = textureView(cmd.coverage);  // T-660b: t0 = the coverage page, LinearClamp
+                textureView(cmd.coverage, bk.v0, bk.id0);  // T-660b: t0 = the coverage page, LinearClamp
             }
             break;
         case Shading::Composite:
         case Shading::Effect:
-            bk.v0 = targetView(cmd.src);
-            if (cmd.aux != 0) bk.v1 = targetView(cmd.aux);
-            if (cmd.texture != 0) bk.v2 = textureView(cmd.texture);
+            targetView(cmd.src, bk.v0, bk.id0);
+            if (cmd.aux != 0) targetView(cmd.aux, bk.v1, bk.id1);
+            if (cmd.texture != 0) textureView(cmd.texture, bk.v2, bk.id2);
+            if (cmd.program == gpu::EffectProgram::BackdropMasked) {  // T-729: t2 = the content (S)
+                targetView(gpu::backdropMaskTarget(frame, cmd), bk.v2, bk.id2);
+            }
             break;
         default:
             break;
@@ -276,9 +446,12 @@ void WgpuDevice::drawCmd(WGPURenderPassEncoder pass, const gpu::DrawCmd& cmd, ui
         g.pipeline = pipeline;
         ++m_stats.pipelineBinds;
     }
-    if (paramOffset != g.paramOffset) {
-        wgpuRenderPassEncoderSetBindGroup(pass, 1, g.paramGroup, 1, &paramOffset);
+    const uint32_t clipOffset = m_cmdClipOffsets[cmdIndex];  // T-718: the zero block without a clip
+    if (paramOffset != g.paramOffset || clipOffset != g.clipOffset) {
+        const uint32_t offsets[2] = {paramOffset, clipOffset};
+        wgpuRenderPassEncoderSetBindGroup(pass, 1, g.paramGroup, 2, offsets);
         g.paramOffset = paramOffset;
+        g.clipOffset = clipOffset;
     }
     if (textures != g.textures) {
         wgpuRenderPassEncoderSetBindGroup(pass, 2, textures, 0, nullptr);

@@ -12,7 +12,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     let effect = pi(1u);
     if (effect == 0) {
         let coverage = pow(tex0(in.uv).r, pf(0u));
-        return in.color * coverage;
+        return in.color * coverage * clipCoverage(in.px);  // T-718: 1 without an analytic clip
     }
     let radius = pf(2u);
     let p = vec2i(floor(in.uv * pf(7u)));
@@ -46,5 +46,5 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
             m = acc / sum;
         }
     }
-    return in.color * min(m, 1.0);
+    return in.color * min(m, 1.0) * clipCoverage(in.px);  // T-718
 }

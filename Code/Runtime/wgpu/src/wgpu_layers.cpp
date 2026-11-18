@@ -33,6 +33,7 @@ gpu::TextureHandle WgpuDevice::acquireLayerTargetWithStencil(uint32_t layerId, u
         releaseTexture(t.texture, t.view);
         return 0;
     }
+    t.viewId = detail::newViewId();  // T-726
     t.width = w;
     t.height = h;
     t.layerNoStencil = !stencil;

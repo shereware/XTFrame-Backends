@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -153,11 +154,52 @@ TEST_CASE("wgpu draw: the geometry buffers upload only what changed (T-159)") {
     Session s(kW, kH);
     s.render(cl);
     const uint64_t first = s.renderer.stats().uploadBytes;
-    // Three rotating sets: the fourth identical frame reuses the first set's content.
-    s.render(cl);
-    s.render(cl);
+    // T-726: one set written against the previous frame: an identical frame writes no geometry.
     s.render(cl);
     CHECK(s.renderer.stats().uploadBytes < first);
+}
+
+TEST_CASE("wgpu draw: one geometry set written against the previous frame draws every frame right (T-726)") {
+    // Frames whose geometry changes in part (a moving bar, a count going up and down that shifts every
+    // later vertex and index) submitted back to back on one renderer, each into a target of its own and
+    // with no readback in between (so writes for a frame meet earlier frames still in flight), then
+    // each compared byte for byte with the same frame drawn by a fresh renderer (every buffer written
+    // whole).
+    constexpr int kW = 96, kH = 64, kFrames = 12;
+    auto frameList = [](int f) {
+        CommandList cl = makeList(kW, kH);
+        addFillRect(cl, 0, 0, kW, kH, Color{0.1f, 0.1f, 0.15f, 1});
+        const int bars = 6 + (f % 4) * 3 - (f % 3);
+        for (int i = 0; i < bars; ++i) {
+            const float x = 2.0f + 5.0f * static_cast<float>(i);
+            const float h = (i == f % bars) ? 50.0f : 20.0f + static_cast<float>((i * 7 + f) % 11);
+            addFillRect(cl, x, 4, 4, h, Color{1, 0.5f + 0.05f * static_cast<float>(i % 5), 0, 1});
+        }
+        const float d = static_cast<float>(f);
+        addFill(cl, addPolygon(cl, {Vec2{60.0f + d, 10}, Vec2{90, 30.0f + d}, Vec2{70, 60}}),
+                Color{0, 0.6f, 1, 0.8f});
+        return cl;
+    };
+    Session s(kW, kH);
+    std::vector<std::unique_ptr<DrawTarget>> targets;
+    uint64_t incremental = 0, whole = 0;
+    s.renderer.setClearColor(0, 0, 0, 1);
+    for (int f = 0; f < kFrames; ++f) {
+        targets.push_back(std::make_unique<DrawTarget>(kW, kH));
+        s.renderer.render(frameList(f), nullptr, nullptr, targets.back()->view);
+        CHECK_MESSAGE(std::string(s.renderer.lastError()).empty(), s.renderer.lastError());
+        if (f > 0) incremental += s.renderer.stats().uploadBytes;
+    }
+    for (int f = 0; f < kFrames; ++f) {
+        std::vector<uint8_t> px(static_cast<size_t>(kW) * kH * 4);
+        REQUIRE(s.renderer.readback(targets[static_cast<size_t>(f)]->texture, px));
+        Session fresh(kW, kH);
+        const std::vector<uint8_t> want = fresh.render(frameList(f));
+        if (f > 0) whole += fresh.renderer.stats().uploadBytes;
+        CHECK_MESSAGE(px == want, "frame " << f);
+    }
+    CHECK(incremental > 0u);     // the frames did change ...
+    CHECK(incremental < whole);  // ... and only in part
 }
 
 namespace {

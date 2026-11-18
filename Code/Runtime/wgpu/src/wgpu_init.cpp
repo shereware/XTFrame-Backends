@@ -12,6 +12,7 @@
 #include <thread>
 
 #include "wgpu_util.h"
+#include "xt/wgpu/wgpu_device.h"  // T-726: labelsEnabled
 #include "xt/wgpu/wgpu_renderer.h"
 
 /// WgpuInit::headless (T-437, Docs/design/10-backends.md §10.10.1): instance -> adapter -> device,
@@ -266,12 +267,18 @@ std::string memoryHintsNote() {
 
 /// requestDevice with `limits` (null = wgpu-native's base limits, as before T-670), waited for.
 /// Null and `message` on failure.
+/// T-734: `gpuTiming` adds TimestampQuery (and TimestampQueryInsideEncoders) when the adapter has it.
 WGPUDevice requestDevice(WGPUInstance instance, WGPUAdapter adapter, const WGPULimits* limits,
-                         WGPUChainedStruct* extras, std::string& message) {
-    WGPUFeatureName features[1];
+                         WGPUChainedStruct* extras, bool gpuTiming, std::string& message) {
+    WGPUFeatureName features[3];
     size_t featureCount = 0;
     if (wgpuAdapterHasFeature(adapter, WGPUFeatureName_TextureCompressionBC) != 0) {
         features[featureCount++] = WGPUFeatureName_TextureCompressionBC;
+    }
+    const auto encoderStamps = static_cast<WGPUFeatureName>(WGPUNativeFeature_TimestampQueryInsideEncoders);
+    if (gpuTiming && wgpuAdapterHasFeature(adapter, WGPUFeatureName_TimestampQuery) != 0) {
+        features[featureCount++] = WGPUFeatureName_TimestampQuery;
+        if (wgpuAdapterHasFeature(adapter, encoderStamps) != 0) features[featureCount++] = encoderStamps;
     }
     WGPUDeviceDescriptor dd = WGPU_DEVICE_DESCRIPTOR_INIT;
     dd.label = WGPUStringView{"xt_wgpu headless", WGPU_STRLEN};
@@ -309,12 +316,14 @@ WGPUDevice requestDevice(WGPUInstance instance, WGPUAdapter adapter, const WGPUL
 /// One instance limited to `backends` -> adapter -> device, into `r`. On failure `r.error` says why
 /// and whatever was created is released.
 bool createOn(WgpuInit& r, WGPUInstanceBackend backends, const std::string& backendName, bool fromOptions,
-              bool allowFallback) {
+              bool allowFallback, bool gpuTiming) {
     r.notes.clear();  // T-671: a retry on other backends reports its own adapter
     WGPUInstanceExtras extras;
     std::memset(&extras, 0, sizeof extras);
     extras.chain.sType = static_cast<WGPUSType>(WGPUSType_InstanceExtras);
     extras.backends = backends;
+    // T-726: wgpu-hal gets no object labels unless XT_WGPU_LABELS=1 (a capture with PIX / RenderDoc).
+    extras.flags = labelsEnabled() ? WGPUInstanceFlag_Empty : WGPUInstanceFlag_DiscardHalLabels;
     WGPUInstanceDescriptor desc = WGPU_INSTANCE_DESCRIPTOR_INIT;
     desc.nextInChain = &extras.chain;
     r.instance = wgpuCreateInstance(&desc);
@@ -385,16 +394,17 @@ bool createOn(WgpuInit& r, WGPUInstanceBackend backends, const std::string& back
     const std::string memoryNote = memoryHintsNote();
     WGPUChainedStruct* deviceExtras = nullptr;
 #endif
-    r.notes += (r.notes.empty() ? "" : "\n") + nativeVersionText() + ", " + memoryNote;
+    r.notes += (r.notes.empty() ? "" : "\n") + nativeVersionText() + ", " + memoryNote + ", " +
+               (labelsEnabled() ? "labels on" : "labels off") + " (XT_WGPU_LABELS)";
     std::string deviceMessage;
-    WGPUDevice device = requestDevice(r.instance, r.adapter, &limits, deviceExtras, deviceMessage);
+    WGPUDevice device = requestDevice(r.instance, r.adapter, &limits, deviceExtras, gpuTiming, deviceMessage);
     if (device == nullptr) {
         std::fprintf(stderr,
                      "xt::wgpu: requestDevice with maxNonSamplerBindings %u failed (%s); retrying with the "
                      "default limits\n",
                      kMaxNonSamplerBindings, deviceMessage.c_str());
         deviceMessage.clear();
-        device = requestDevice(r.instance, r.adapter, nullptr, deviceExtras, deviceMessage);
+        device = requestDevice(r.instance, r.adapter, nullptr, deviceExtras, gpuTiming, deviceMessage);
     }
     if (device == nullptr) {
         r.error = "requestDevice failed (" + deviceMessage + ")";
@@ -403,10 +413,24 @@ bool createOn(WgpuInit& r, WGPUInstanceBackend backends, const std::string& back
     }
     r.device = device;
     r.queue = wgpuDeviceGetQueue(r.device);
+    if (gpuTiming) {  // T-734 (10 §10.19)
+        const bool stamps = wgpuDeviceHasFeature(device, WGPUFeatureName_TimestampQuery) != 0;
+        const bool inEncoders =
+            wgpuDeviceHasFeature(
+                device, static_cast<WGPUFeatureName>(WGPUNativeFeature_TimestampQueryInsideEncoders)) != 0;
+        r.notes += std::string("\ngpu timing: ") + (!stamps      ? "unsupported"
+                                                    : inEncoders ? "encoder timestamps"
+                                                                 : "pass timestamps");
+    }
     return true;
 }
 
 }  // namespace
+
+bool labelsEnabled() {
+    static const bool enabled = envString("XT_WGPU_LABELS") == "1";  // T-726: read once
+    return enabled;
+}
 
 std::string takeDeviceErrors() {
     std::lock_guard<std::mutex> lock(g_errorMutex);
@@ -445,7 +469,8 @@ WgpuInit WgpuInit::headless(const WgpuHeadlessOptions& options) {
         return r;
     }
     const bool allowFallback = options.allowFallback || envString("XT_WGPU_FALLBACK") == "1";
-    if (createOn(r, plan.first, backendName, fromOptions, allowFallback) || !plan.retryPrimary) {
+    if (createOn(r, plan.first, backendName, fromOptions, allowFallback, options.gpuTiming) ||
+        !plan.retryPrimary) {
         return r;
     }
     // T-670 (50 §50.ab addendum 1 i): no adapter or device on the D3D12-only instance (createOn
@@ -455,7 +480,7 @@ WgpuInit WgpuInit::headless(const WgpuHeadlessOptions& options) {
                  "backends\n",
                  r.error.c_str());
     r.error.clear();
-    createOn(r, WGPUInstanceBackend_Primary, backendName, fromOptions, allowFallback);
+    createOn(r, WGPUInstanceBackend_Primary, backendName, fromOptions, allowFallback, options.gpuTiming);
     return r;
 }
 

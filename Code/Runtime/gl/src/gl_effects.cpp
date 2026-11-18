@@ -15,7 +15,7 @@ bool readParams(const float* params, size_t available, T& out) {
     if (params == nullptr || available * sizeof(float) < sizeof(T)) {
         return false;
     }
-    std::memcpy(&out, params, sizeof(T));
+    std::memcpy(static_cast<void*>(&out), params, sizeof(T));
     return true;
 }
 
@@ -26,7 +26,7 @@ const char* const kUniformNames[] = {
     "uOpacity", "uLutWidth",       "uFbSize",    "uInvXf",       "uP0",           "uP1",       "uRadial",
     "uCenter",  "uEdge0",          "uEdge1",     "uColor",       "uIntensity",    "uOffsetUV", "uScale",
     "uColorA",  "uEffectAlphaMul", "uLineOnTop", "uMaskOutside", "uPosition",     "uSoftness", "uMode",
-    "uSrcSize", "uDstSize",        "uMix",
+    "uSrcSize", "uDstSize",        "uMix",       "uChannel",
 };
 
 }  // namespace
@@ -54,6 +54,7 @@ bool EffectPrograms::init(std::string& err) {
         {EffectProgram::Downsample, shaders::kFxDownsampleFrag},  // T-343
         {EffectProgram::Kawase, shaders::kFxKawaseFrag},
         {EffectProgram::LevelMix, shaders::kFxLevelMixFrag},
+        {EffectProgram::BackdropMasked, shaders::kFxBackdropMaskedFrag},  // T-729
     };
     GLint previous = 0;
     glGetIntegerv(GL_CURRENT_PROGRAM, &previous);
@@ -70,7 +71,8 @@ bool EffectPrograms::init(std::string& err) {
         }
         p.shadow = UniformShadow{};
         // Sampler units never change: unit 0 = src (named uTex or uSrc), 1 = aux (uMaskA,
-        // uSdf, uBackdrop, uMask), 2 = the LUT (uLut). A -1 location is a no-op.
+        // uSdf, uBackdrop, uMask), 2 = the LUT (uLut) or BackdropMasked's content (uSrcMask, T-729).
+        // A -1 location is a no-op.
         glUseProgram(prog);
         glUniform1i(glGetUniformLocation(prog, "uTex"), 0);
         glUniform1i(glGetUniformLocation(prog, "uSrc"), 0);
@@ -79,6 +81,7 @@ bool EffectPrograms::init(std::string& err) {
         glUniform1i(glGetUniformLocation(prog, "uBackdrop"), 1);
         glUniform1i(glGetUniformLocation(prog, "uMask"), 1);
         glUniform1i(glGetUniformLocation(prog, "uLut"), 2);
+        glUniform1i(glGetUniformLocation(prog, "uSrcMask"), 2);
         glUniform1f(p.locs[uLutWidth], static_cast<float>(gpu::kGradientLutWidth));
     }
     glUseProgram(static_cast<GLuint>(previous));
@@ -118,6 +121,7 @@ bool EffectPrograms::bind(gpu::EffectProgram program, const float* params, size_
             if (!readParams(params, available, dp)) return false;
             u.set2f(L[uSrcSize], dp.srcW, dp.srcH);
             u.set2f(L[uDstSize], dp.dstW, dp.dstH);
+            u.set1i(L[uChannel], static_cast<int>(dp.channel));  // T-728
             return true;
         }
         case EffectProgram::Kawase: {  // T-343
@@ -146,6 +150,7 @@ bool EffectPrograms::bind(gpu::EffectProgram program, const float* params, size_
             u.set1fv(L[uOffsets], 33, gp.offsets);
             u.set1i(L[uConstEdge], gp.constEdge != 0.0f ? 1 : 0);
             u.set1f(L[uOutside], gp.outside);
+            u.set1i(L[uChannel], static_cast<int>(gp.channel));  // T-728 (GaussScalar only)
             return true;
         }
         case EffectProgram::Dilate: {
@@ -237,6 +242,7 @@ bool EffectPrograms::bind(gpu::EffectProgram program, const float* params, size_
             return true;
         }
         case EffectProgram::Backdrop:
+        case EffectProgram::BackdropMasked:  // T-729: its third input is `lutTex` (unit 2)
             return true;
         case EffectProgram::MaskApply: {
             gpu::MaskApplyParams mp{};

@@ -41,9 +41,9 @@
 /// submit; every submit's first surface pass clears them or loads the host's content, so nothing of
 /// another device's frame shows) and the dummy -- see wgpu_shared.h.
 ///
-/// `submit` (T-438): the frame's vertex/index/instance buffers are uploaded incrementally into one
-/// of three rotating sets; the per-pass constants and every command's parameter block go into one
-/// uniform buffer addressed with dynamic offsets; each `Pass` is one render pass whose commands are
+/// `submit` (T-438): the frame's vertex/index/instance buffers are uploaded incrementally (T-726: one
+/// set, against the previous frame's content); the per-pass constants and every command's parameter block go
+/// into one uniform buffer addressed with dynamic offsets; each `Pass` is one render pass whose commands are
 /// drawn with the cached pipeline of (shading/program, blend, stencil op, draw kind, target format,
 /// samples, stencil attachment) -- the WGSL of src/shaders mirrors gl_shaders.h shader by shader.
 /// A `Pass::copy` is a `copyTextureToTexture` when both sides are single-sample textures of one
@@ -59,6 +59,10 @@
 
 namespace xt::wgpu {
 
+namespace detail {
+class GpuTimer;  // T-734: wgpu_timing.h
+}  // namespace detail
+
 class WgpuSharedCache;
 
 /// T-678 (50 §50.ac addendum item 2): bytes per texel of a `WGPUTextureFormat_Stencil8` texture as
@@ -66,15 +70,24 @@ class WgpuSharedCache;
 /// S8 / D24S8 / D32S8 is not visible through WebGPU and is counted as 1).
 uint32_t stencil8TexelBytes(WGPUBackendType backend);
 
+/// T-726: whether xt_wgpu hands debug labels to the backend. Off by default: an instance it creates
+/// (`WgpuInit::headless`) gets `WGPUInstanceFlag_DiscardHalLabels` and its render passes carry no label
+/// (whoever created the device -- a host's own instance is never changed). On with the environment
+/// variable `XT_WGPU_LABELS=1` (read once), for PIX / RenderDoc captures.
+bool labelsEnabled();
+
 /// What the last `submit` did (for tests and tools; not a stable API).
 struct WgpuDeviceStats {
-    uint32_t passes = 0;            ///< render passes encoded
-    uint32_t clears = 0;            ///< of which cleared their color attachment
-    uint32_t resolves = 0;          ///< T-658: surface passes that resolved the 4x attachment into it
-    uint32_t surfaceReads = 0;      ///< T-658: passes that copy from the surface (each resolved before)
-    uint32_t drawCalls = 0;         ///< draw / drawIndexed calls (blits included)
-    uint32_t pipelineBinds = 0;     ///< setPipeline calls
-    uint32_t bindGroups = 0;        ///< texture bind groups created this submit
+    uint32_t passes = 0;         ///< render passes encoded
+    uint32_t clears = 0;         ///< of which cleared their color attachment
+    uint32_t resolves = 0;       ///< T-658: surface passes that resolved the 4x attachment into it
+    uint32_t surfaceReads = 0;   ///< T-658: passes that copy from the surface (each resolved before)
+    uint32_t drawCalls = 0;      ///< draw / drawIndexed calls (blits included)
+    uint32_t pipelineBinds = 0;  ///< setPipeline calls
+    uint32_t bindGroups = 0;     ///< texture bind groups created this submit
+    /// T-726: cached bind groups removed because a view they name was destroyed (or, T-457, the blit
+    /// groups because the uniform buffer was replaced), since the previous submit's end.
+    uint32_t bindGroupEvictions = 0;
     uint32_t copies = 0;            ///< copy passes done with copyTextureToTexture
     uint32_t blits = 0;             ///< copy passes / surface loads done with a blit draw
     uint32_t cacheStores = 0;       ///< cache stores executed
@@ -139,6 +152,10 @@ public:
     /// from, for the byte counts of the Stencil8 attachments (`stencil8TexelBytes`); Undefined (the
     /// default) counts one byte per texel.
     void setBackendType(WGPUBackendType backend) { m_stencilTexelBytes = stencil8TexelBytes(backend); }
+    /// T-734 (Docs/design/10-backends.md §10.19): the GPU timer whose timestamps `submit` writes into
+    /// its frame encoder and render passes (WgpuRenderer::setGpuTiming); null (the default) = none,
+    /// and `submit` encodes exactly what it did before. Not owned.
+    void setGpuTimer(detail::GpuTimer* timer) { m_timer = timer; }
 
     /// Size of the surface target in pixels (the views passed to `setSurface`).
     void resize(int width, int height);
@@ -181,6 +198,13 @@ public:
     /// T-691 (§10.14): coverage quads (T-660b) and Shading::BoxShadow (T-668) are implemented.
     bool supportsCoverageDraws() const override { return true; }
     bool supportsBoxShadowShading() const override { return true; }
+    /// T-718 (§10.16 W1): every leaf program multiplies by the command's AnalyticClipParams coverage.
+    bool supportsAnalyticClip() const override { return true; }
+    /// T-728 (§10.18 A item 1): fx_downsample / fx_gauss_scalar read DownsampleParams / GaussParams
+    /// `channel`.
+    bool supportsAlphaChannelReads() const override { return true; }
+    /// T-729 (§10.18 B): fx_backdrop_masked takes the content as its third input (t2).
+    bool supportsBackdropMask() const override { return true; }
     /// T-648: image textures through the borrowed WgpuSharedCache (see gpu::GpuDevice). A shared
     /// image's handle is an external entry of this device's table naming the cache's view.
     bool sharesImageTextures() const override { return m_sharing != nullptr; }
@@ -191,10 +215,11 @@ public:
     void releaseSharedImage(gpu::TextureHandle tex, bool keep) override;
     /// T-665 (Docs/design/10-backends.md §10.11 item 7): a texture with every level replaces the
     /// image's one-level texture (a shared image's for every device of the cache, whose bind groups
-    /// then flush through `viewGeneration`); level 0 is copied and each further level drawn as the
-    /// 2x2 box mean of the one above (blit.wgsl fs_mip_box) -- or uploaded from `storedLevels` for a
-    /// block-compressed image -- in a submission of its own, queued before any later draw. Rgba8 and
-    /// BC images only; host views, targets and BC images without stored levels stay single-level.
+    /// then drop the old view's groups through the cache's view log, T-726); level 0 is copied and each
+    /// further level drawn as the 2x2 box mean of the one above (blit.wgsl fs_mip_box) -- or uploaded from
+    /// `storedLevels` for a block-compressed image -- in a submission of its own, queued before any later
+    /// draw. Rgba8 and BC images only; host views, targets and BC images without stored levels stay
+    /// single-level.
     uint32_t requestMipChain(gpu::TextureHandle tex, const void* storedLevels = nullptr,
                              uint32_t storedLevelCount = 0) override;
     /// T-656 (50 §50.ab item 1, `xt_gpu_memory_stats.surface_bytes`): the memory of the surface
@@ -273,6 +298,7 @@ public:
         uint32_t sharedId = 0;        ///< T-648: a use of WgpuSharedCache image `sharedId` (external)
         uint32_t levels = 1;          ///< T-665: mip levels (a shared image: the cache's Image::levels)
         bool layerNoStencil = false;  ///< T-703: a layer target acquired without stencil
+        uint64_t viewId = 0;          ///< T-726: detail::newViewId of `view` (a shared image: the cache's)
     };
     /// One pooled offscreen target: `color` is drawn into (4x when `samples` is 4) and resolves
     /// into `resolve`; with one sample `resolve` is null and `color` is the sampleable texture.
@@ -292,6 +318,7 @@ public:
         uint64_t bytes = 0;
         /// T-685: the user that borrowed it last (WgpuDevice::setPoolUser; 0 = the anonymous user).
         uint32_t user = 0;
+        uint64_t viewId = 0;  ///< T-726: detail::newViewId of the sampleable view (resolve, else color)
         /// T-675: a slot of a pool keeps its index while it lives (other devices' frame targets name
         /// it); a destroyed entry leaves an empty slot (`color` null) for the next one.
         bool live() const { return color != nullptr; }
@@ -374,6 +401,7 @@ private:
     std::vector<Window> m_windows;  ///< each transient's window (its last pass's)
     std::vector<PassPlan> m_plans;
     std::vector<uint32_t> m_cmdParamOffsets;  ///< group 1 dynamic offset per command
+    std::vector<uint32_t> m_cmdClipOffsets;   ///< T-718: group 1's analytic clip offset per command
     std::vector<uint8_t> m_resolveSurface;    ///< T-658: per pass, 1 = a surface pass that resolves
     std::vector<float> m_uniformData;
 
@@ -381,11 +409,20 @@ private:
     WGPUSubmissionIndex m_lastSubmission = 0;  ///< T-674
     std::string m_warning;
     WgpuDeviceStats m_stats;
+    detail::GpuTimer* m_timer = nullptr;  ///< T-734: setGpuTimer
+
+    /// T-734 (wgpu_timing.cpp): `submit`'s frame encoder, render pass and finish, through the timer
+    /// when there is one.
+    WGPUCommandEncoder createFrameEncoder();
+    WGPURenderPassEncoder beginRenderPass(WGPUCommandEncoder enc, WGPURenderPassDescriptor& rp);
+    WGPUCommandBuffer finishFrameEncoder(WGPUCommandEncoder enc);
 
     const Texture* find(gpu::TextureHandle tex) const;
     /// T-665: the view to sample `t` through -- for a shared image the cache's current one (another
     /// device may have given it its mip chain since this entry was made).
     WGPUTextureView viewOf(const Texture& t) const;
+    /// T-726: the view id of viewOf(t).
+    uint64_t viewIdOf(const Texture& t) const;
     gpu::TextureHandle addTexture(const Texture& t);
     /// T-648: borrows the pipeline set of `m_shared` (creating it on first use) for `init`.
     bool borrowSharedPipelines(WGPUTextureFormat format, uint32_t samples, std::string& err);
@@ -405,9 +442,16 @@ private:
     /// device's submits).
     uint32_t poolFrame() const;
     uint64_t poolBudget() const;
-    /// T-675: a pooled or cached view was destroyed: flushes this device's bind groups and, when
-    /// sharing, tells the other devices of the cache to flush theirs before their next submit.
-    void noteViewsDestroyed();
+    /// T-726: view `id` is (about to be) destroyed: removes this device's bind groups naming it and,
+    /// when `shared` and the device borrows a cache, logs it there so the other devices remove theirs
+    /// before their next submit (syncSharedViews). 0 = nothing.
+    void forgetView(uint64_t id, bool shared);
+    /// T-726 (T-675): removes the bind groups naming the views the cache logged since this device last
+    /// looked (all of them when the log no longer reaches back that far).
+    void syncSharedViews();
+    /// T-726: cached bind groups removed because a view they name was destroyed, since the last submit's
+    /// end (WgpuDeviceStats::bindGroupEvictions).
+    uint32_t m_evictedBindGroups = 0;
     /// T-675: a texture this device created on a shared cache's device (WgpuSharedStats).
     void countTextureCreate();
     /// T-665: requestMipChain's work (timed by it).
@@ -440,8 +484,13 @@ private:
     Window windowOf(gpu::TargetHandle target) const;
     /// The sampleable view of target `t` (a transient's resolve or color view; the surface view).
     WGPUTextureView sampleView(gpu::TargetHandle t) const;
+    /// T-726: its view id (0 for the surface or no target).
+    uint64_t sampleViewId(gpu::TargetHandle t) const;
     /// Plans every pass (windows, copies) and fills the uniform buffer.
     void planFrame(const gpu::GpuFrame& frame);
+    /// T-718: appends the analytic clip block of every distinct DrawCmd::clipParamIndex to the uniform
+    /// data and fills m_cmdClipOffsets (0, the zero block, for a command without one). planFrame calls it.
+    void planClipBlocks(const gpu::GpuFrame& frame);
     /// T-658: which surface passes resolve the 4x attachment (`m_resolveSurface`): the last one and
     /// the last one before each pass reading target 0. `groupsOk` / `surfaceOk` as submit skips.
     void planSurfaceResolves(bool groupsOk, bool surfaceOk);
@@ -450,10 +499,11 @@ private:
     /// Draws one command into the open pass (wgpu_draw.cpp).
     void drawCmd(WGPURenderPassEncoder pass, const gpu::DrawCmd& cmd, uint32_t cmdIndex, const PassPlan& plan,
                  gpu::TargetHandle target);
-    /// One blit draw of `src` into the open pass over the target rectangle (x, y, w, h).
-    void blit(WGPURenderPassEncoder pass, WGPUTextureView src, uint32_t uniformOffset, int x, int y, int w,
-              int h, WGPUTextureFormat format, uint32_t samples, bool hasStencil, uint32_t targetW,
-              uint32_t targetH);
+    /// One blit draw of `src` (T-726: view id `srcId`) into the open pass over the target rectangle
+    /// (x, y, w, h).
+    void blit(WGPURenderPassEncoder pass, WGPUTextureView src, uint64_t srcId, uint32_t uniformOffset, int x,
+              int y, int w, int h, WGPUTextureFormat format, uint32_t samples, bool hasStencil,
+              uint32_t targetW, uint32_t targetH);
     void executeCacheStore(WGPUCommandEncoder enc, const gpu::CacheStore& store);
 };
 

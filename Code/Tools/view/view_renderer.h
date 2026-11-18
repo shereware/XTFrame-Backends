@@ -79,13 +79,26 @@ struct GpuFrameCounters {
     uint32_t clipScissor = 0;         ///< as one image polygon, or as a mask layer
     uint32_t clipImageDirect = 0;
     uint32_t clipMaskLayers = 0;
-    float buildMs = 0;   ///< FrameBuilder::build (0 for a reused frame)
-    float submitMs = 0;  ///< the device's encode and queue submit
+    uint32_t analyticClips = 0;          ///< T-718: rounded clips drawn as analytic clip levels,
+    uint32_t analyticClipFallbacks = 0;  ///< and clips that fell back to a mask layer
+    uint32_t effectCachePhaseHits = 0;   ///< T-721: effect cache hits a fraction of a pixel away,
+    uint32_t effectCacheSettles = 0;     ///< and segments drawn again at rest
+    uint32_t backdropPairHits = 0;       ///< T-730: backdrop pairs served from the cache,
+    uint32_t backdropPairMisses = 0;     ///< drawn in full,
+    uint32_t backdropPairStores = 0;     ///< stored
+    uint64_t effectCacheBytes = 0;       ///< T-730: what the effect cache holds after the build
+    uint32_t effectCacheEntries = 0;     ///< and its entries (a pair counts two)
+    float buildMs = 0;                   ///< FrameBuilder::build (0 for a reused frame)
+    float submitMs = 0;                  ///< the device's encode and queue submit
     /// T-670: live / peak non-sampler bindings of the wgpu device (WgpuDeviceStats); `hasBindings`
     /// is false for a renderer without them.
     bool hasBindings = false;
     uint32_t liveBindings = 0;
     uint32_t peakBindings = 0;
+    /// T-726: bind groups the wgpu device created, and cached ones it removed because a view they name
+    /// was destroyed (WgpuDeviceStats::bindGroups / bindGroupEvictions).
+    uint32_t bindGroups = 0;
+    uint32_t bindGroupEvictions = 0;
     /// T-674: waits of the frame's begin for the GPU (more than two frames behind) and their ms.
     uint32_t inflightWaits = 0;
     float inflightWaitMs = 0;

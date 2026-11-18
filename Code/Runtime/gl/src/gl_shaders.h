@@ -25,21 +25,77 @@ layout(location = 2) in vec4 aColor;
 uniform mat3 uNdc;
 out vec2 vUV;
 out vec4 vColor;
+noperspective out vec2 vPx;
 void main() {
     vec2 xy = aPosW.xy / aPosW.z;
     vec3 p = uNdc * vec3(xy, 1.0);
     gl_Position = vec4(p.xy * aPosW.z, 0.0, aPosW.z);
     vUV = aUV;
     vColor = aColor;
+    vPx = xy;
 }
 )";
+
+/// T-719 (Docs/design/10-backends.md section 10.16 W1 item 2; gpu_frame.h AnalyticClipParams): the
+/// analytic rounded-rect clips of a leaf draw (`DrawCmd::clipParamIndex`), shared by the twelve leaf
+/// fragment shaders after their inputs. `uClipCount` = the active slots (0..3; 0 for a draw without a
+/// block), `uClip` = the block's twelve vec4, four per slot: localFromDevice (a, b, c, d), (e, f, -, -),
+/// the rectangle (x, y, w, h) and its radii (tl, tr, br, bl). `vPx` is the fragment's position in
+/// surface pixels, interpolated linearly in screen space (exact for projected vertices too).
+/// clipSlotCoverage: clamp(0.5 - d, 0, 1), d = the signed distance to the rounded rectangle's boundary
+/// in device pixels -- the local signed distance over the length of its gradient taken back to device
+/// space (M^T g, M = the 2x2 of localFromDevice). clipCoverage: the product over the slots, exactly 1
+/// without a clip, so a leaf's output times it is its output of before. Mirrors prelude.wgsl's
+/// clipSlotCoverage / clipCoverage operation by operation.
+#define XT_GL_ANALYTIC_CLIP_COMMON \
+    R"(noperspective in vec2 vPx;
+uniform int uClipCount;
+uniform vec4 uClip[12];
+float clipSlotCoverage(int i, vec2 px) {
+    vec4 m = uClip[i * 4];
+    vec4 t = uClip[i * 4 + 1];
+    vec4 rect = uClip[i * 4 + 2];
+    vec4 radii = uClip[i * 4 + 3];
+    vec2 p = vec2(m.x * px.x + m.z * px.y + t.x, m.y * px.x + m.w * px.y + t.y);
+    vec2 hs = rect.zw * 0.5;
+    vec2 q0 = p - (rect.xy + hs);
+    bool right = q0.x > 0.0;
+    bool lower = q0.y > 0.0;
+    float r = lower ? (right ? radii.z : radii.w) : (right ? radii.y : radii.x);
+    vec2 s = vec2(right ? 1.0 : -1.0, lower ? 1.0 : -1.0);
+    vec2 q = abs(q0) - hs + vec2(r);
+    float d;
+    vec2 g;
+    if (q.x > 0.0 && q.y > 0.0) {
+        float l = length(q);
+        d = l - r;
+        g = q / l * s;
+    } else if (q.x > q.y) {
+        d = q.x - r;
+        g = vec2(s.x, 0.0);
+    } else {
+        d = q.y - r;
+        g = vec2(0.0, s.y);
+    }
+    vec2 gd = vec2(m.x * g.x + m.y * g.y, m.z * g.x + m.w * g.y);
+    return clamp(0.5 - d / max(length(gd), 1e-20), 0.0, 1.0);
+}
+float clipCoverage(vec2 px) {
+    float c = 1.0;
+    int n = min(uClipCount, 3);
+    for (int i = 0; i < n; ++i) {
+        c = c * clipSlotCoverage(i, px);
+    }
+    return c;
+}
+)"
 
 inline constexpr const char* kSolidFrag = R"(#version 330 core
 in vec2 vUV;
 in vec4 vColor;
 out vec4 fragColor;
-void main() {
-    fragColor = vColor;
+)" XT_GL_ANALYTIC_CLIP_COMMON R"(void main() {
+    fragColor = vColor * clipCoverage(vPx);  // T-719: 1 without an analytic clip
 }
 )";
 
@@ -57,7 +113,7 @@ uniform vec2 uP1;
 uniform vec2 uRadialAxes;
 uniform float uPaintAlpha;
 uniform float uLutWidth;
-void main() {
+)" XT_GL_ANALYTIC_CLIP_COMMON R"(void main() {
     vec2 d = uP1 - uP0;
     float lenSq = dot(d, d);
     float t;
@@ -77,7 +133,7 @@ void main() {
     float u = (t * (uLutWidth - 1.0) + 0.5) / uLutWidth;
     vec4 c = texture(uLut, vec2(u, 0.5));
     float a = c.a * uPaintAlpha * vColor.a;
-    fragColor = vec4(c.rgb * a, a);
+    fragColor = vec4(c.rgb * a, a) * clipCoverage(vPx);  // T-719: 1 without an analytic clip
 }
 )";
 
@@ -169,8 +225,8 @@ inline constexpr const char* kBoxShadowFrag = R"(#version 330 core
 in vec2 vUV;
 in vec4 vColor;
 out vec4 fragColor;
-)" XT_GL_BOX_SHADOW_COMMON R"(void main() {
-    fragColor = uColor * bsCoverage(uShape, uRadii, vUV);
+)" XT_GL_ANALYTIC_CLIP_COMMON XT_GL_BOX_SHADOW_COMMON R"(void main() {
+    fragColor = uColor * bsCoverage(uShape, uRadii, vUV) * clipCoverage(vPx);  // T-719
 }
 )";
 
@@ -187,7 +243,7 @@ uniform vec4 uRadii1;
 uniform vec4 uShape2;
 uniform vec4 uRadii2;
 uniform vec3 uTerms;
-)" XT_GL_BOX_SHADOW_COMMON R"(void main() {
+)" XT_GL_ANALYTIC_CLIP_COMMON XT_GL_BOX_SHADOW_COMMON R"(void main() {
     vec2 p = vUV;
     float coverage = bsCoverage(uShape, uRadii, p);
     vec4 shapes[2] = vec4[2](uShape1, uShape2);
@@ -198,7 +254,7 @@ uniform vec3 uTerms;
         coverage += signs[t] * bsCoverage(shapes[t], radii[t], p);
     }
     coverage = clamp(coverage, 0.0, 1.0);
-    fragColor = uColor * coverage;
+    fragColor = uColor * coverage * clipCoverage(vPx);  // T-719
 }
 )";
 
@@ -210,8 +266,8 @@ in vec2 vUV;
 in vec4 vColor;
 out vec4 fragColor;
 uniform sampler2D uCoverage;
-void main() {
-    fragColor = vColor * texture(uCoverage, vUV).r;
+)" XT_GL_ANALYTIC_CLIP_COMMON R"(void main() {
+    fragColor = vColor * texture(uCoverage, vUV).r * clipCoverage(vPx);  // T-719: 1 without an analytic clip
 }
 )";
 
@@ -231,7 +287,7 @@ uniform vec2 uRadialAxes;
 uniform float uPaintAlpha;
 uniform float uLutWidth;
 uniform mat3 uUvToLocal;
-void main() {
+)" XT_GL_ANALYTIC_CLIP_COMMON R"(void main() {
     vec2 local = (uUvToLocal * vec3(vUV, 1.0)).xy;
     vec2 d = uP1 - uP0;
     float lenSq = dot(d, d);
@@ -251,7 +307,7 @@ void main() {
     float u = (t * (uLutWidth - 1.0) + 0.5) / uLutWidth;
     vec4 c = texture(uLut, vec2(u, 0.5));
     float a = c.a * uPaintAlpha * vColor.a * texture(uCoverage, vUV).r;
-    fragColor = vec4(c.rgb * a, a);
+    fragColor = vec4(c.rgb * a, a) * clipCoverage(vPx);  // T-719: 1 without an analytic clip
 }
 )";
 
@@ -260,8 +316,8 @@ in vec2 vUV;
 in vec4 vColor;
 out vec4 fragColor;
 uniform sampler2D uTex;
-void main() {
-    fragColor = texture(uTex, vUV) * vColor;
+)" XT_GL_ANALYTIC_CLIP_COMMON R"(void main() {
+    fragColor = texture(uTex, vUV) * vColor * clipCoverage(vPx);  // T-719: 1 without an analytic clip
 }
 )";
 
@@ -278,6 +334,7 @@ uniform mat3 uNdc;
 uniform mat3 uXf;
 out vec2 vUV;
 out vec4 vColor;
+noperspective out vec2 vPx;
 const vec2 kCorners[6] = vec2[6](vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(1.0, 1.0),
                                  vec2(0.0, 0.0), vec2(1.0, 1.0), vec2(0.0, 1.0));
 void main() {
@@ -291,6 +348,7 @@ void main() {
     gl_Position = vec4(p.xy, 0.0, 1.0);
     vUV = mix(aUv.xy, aUv.zw, corner);
     vColor = aColor;
+    vPx = px.xy;
 }
 )";
 
@@ -302,12 +360,12 @@ in vec4 vColor;
 out vec4 fragColor;
 uniform sampler2D uTex;
 uniform float uStraight;
-void main() {
+)" XT_GL_ANALYTIC_CLIP_COMMON R"(void main() {
     vec4 s = texture(uTex, vUV);
     if (uStraight != 0.0) {
         s = vec4(s.rgb * s.a, s.a);
     }
-    fragColor = s * vColor;
+    fragColor = s * vColor * clipCoverage(vPx);  // T-719: 1 without an analytic clip
 }
 )";
 
@@ -316,8 +374,8 @@ inline constexpr const char* kParticleSolidFrag = R"(#version 330 core
 in vec2 vUV;
 in vec4 vColor;
 out vec4 fragColor;
-void main() {
-    fragColor = vColor;
+)" XT_GL_ANALYTIC_CLIP_COMMON R"(void main() {
+    fragColor = vColor * clipCoverage(vPx);  // T-719: 1 without an analytic clip
 }
 )";
 
@@ -328,9 +386,9 @@ in vec2 vUV;
 in vec4 vColor;
 out vec4 fragColor;
 uniform sampler2D uTex;
-void main() {
+)" XT_GL_ANALYTIC_CLIP_COMMON R"(void main() {
     vec4 s = texture(uTex, vUV);
-    fragColor = vec4(s.rgb * s.a, s.a) * vColor;
+    fragColor = vec4(s.rgb * s.a, s.a) * vColor * clipCoverage(vPx);  // T-719: 1 without an analytic clip
 }
 )";
 
@@ -350,7 +408,7 @@ uniform int uEffect;
 uniform float uRadius;
 uniform vec4 uRect;
 uniform float uTexSize;
-float cov(ivec2 t) {
+)" XT_GL_ANALYTIC_CLIP_COMMON R"(float cov(ivec2 t) {
     if (t.x < int(uRect.x) || t.y < int(uRect.y) || t.x >= int(uRect.z) || t.y >= int(uRect.w)) {
         return 0.0;
     }
@@ -359,7 +417,7 @@ float cov(ivec2 t) {
 void main() {
     if (uEffect == 0) {
         float coverage = pow(texture(uTex, vUV).r, uGamma);
-        fragColor = vColor * coverage;
+        fragColor = vColor * coverage * clipCoverage(vPx);  // T-719: 1 without an analytic clip
         return;
     }
     ivec2 p = ivec2(floor(vUV * uTexSize));
@@ -393,7 +451,7 @@ void main() {
             m = acc / sum;
         }
     }
-    fragColor = vColor * min(m, 1.0);
+    fragColor = vColor * min(m, 1.0) * clipCoverage(vPx);  // T-719
 }
 )";
 
@@ -547,9 +605,16 @@ uniform float uWeights[33];  // index 0 = center weight; 1..uTapCount = merged-p
 uniform float uOffsets[33];  // index 0 unused; 1..uTapCount = merged-pair offsets (px)
 uniform int uConstEdge;      // 1: taps outside [0,1]^2 read uOutside; 0: GL_CLAMP_TO_EDGE
 uniform float uOutside;      // DropShadow inset: the inverted alpha is 1 outside the buffer
+uniform int uChannel;        // T-728: 0 = .r; a color source read as 1 = .a, 2 = 1 - .a
 float samp(vec2 uv) {
     if (uConstEdge == 1 && (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0)) {
         return uOutside;
+    }
+    if (uChannel == 1) {
+        return texture(uTex, uv).a;
+    }
+    if (uChannel == 2) {
+        return 1.0 - texture(uTex, uv).a;
     }
     return texture(uTex, uv).r;
 }
@@ -874,6 +939,24 @@ void main() {
 }
 )";
 
+// T-729 (Docs/design/10-backends.md §10.18 B): BackdropBlur's composite when only shadow-type effects
+// follow it. `uSrc` is R' (the content with those effects), `uBackdrop` the blurred + colour-adjusted
+// backdrop, `uSrcMask` the content alone, whose alpha masks the backdrop:
+// `dst = R' + backdrop * alpha(content) * (1 - alpha(R'))` -- mirrors xt::sw::applyBackdropBlurUnder.
+inline constexpr const char* kFxBackdropMaskedFrag = R"(#version 330 core
+in vec2 vUV;
+out vec4 fragColor;
+uniform sampler2D uSrc;
+uniform sampler2D uBackdrop;
+uniform sampler2D uSrcMask;
+void main() {
+    vec4 top = texture(uSrc, vUV);
+    vec4 bottom = texture(uBackdrop, vUV) * texture(uSrcMask, vUV).a;
+    float inv = 1.0 - top.a;
+    fragColor = vec4(top.rgb + bottom.rgb * inv, top.a + bottom.a * inv);
+}
+)";
+
 // `EffectProgram::MaskApply` (gpu_frame.h's MaskApplyParams): `uSrc` is the masked content,
 // `uMask` the mask shape (both premultiplied); output = src * m. Replaces the pre-T-147 composite
 // shader's mask modes 17-20.
@@ -903,16 +986,25 @@ void main() {
 // T-343 (Docs/design/18-effects.md §18.15, gpu_frame.h `DownsampleParams`): exact 2 x 2 box
 // downsample. The fragment's own row is bottom-up in GL, so it is turned top-down, the four
 // source texels fetched top-down (clamped to the source's last column / row) and each flipped
-// back into GL's row order for the fetch.
+// back into GL's row order for the fetch. T-728: uChannel 1 / 2 turns each texel into its alpha /
+// 1 - alpha in every channel (0: the texel as it is).
 inline constexpr const char* kFxDownsampleFrag = R"(#version 330 core
 out vec4 fragColor;
 uniform sampler2D uTex;
 uniform vec2 uSrcSize;
 uniform vec2 uDstSize;
+uniform int uChannel;
 vec4 fetchTopDown(ivec2 p) {
     ivec2 srcMax = ivec2(uSrcSize) - ivec2(1);
     p = clamp(p, ivec2(0), srcMax);
-    return texelFetch(uTex, ivec2(p.x, srcMax.y - p.y), 0);
+    vec4 t = texelFetch(uTex, ivec2(p.x, srcMax.y - p.y), 0);
+    if (uChannel == 1) {
+        return vec4(t.a);
+    }
+    if (uChannel == 2) {
+        return vec4(1.0 - t.a);
+    }
+    return t;
 }
 void main() {
     ivec2 d = ivec2(gl_FragCoord.xy);
@@ -987,7 +1079,7 @@ in vec4 vColor;
 out vec4 fragColor;
 uniform sampler2D uTex;
 uniform vec4 uLodParams;
-vec4 levelSample(float level) {
+)" XT_GL_ANALYTIC_CLIP_COMMON R"(vec4 levelSample(float level) {
     vec4 s = textureLod(uTex, vUV, level);
     return uLodParams.z != 0.0 ? vec4(s.rgb * s.a, s.a) : s;
 }
@@ -999,7 +1091,7 @@ void main() {
     if (t > 0.0) {
         s = mix(s, levelSample(hi), t);
     }
-    fragColor = s * vColor;
+    fragColor = s * vColor * clipCoverage(vPx);  // T-719: 1 without an analytic clip
 }
 )";
 

@@ -8,6 +8,10 @@ add_executable(xt_gl_tests
     test_gl_mips.cpp  # T-665
     test_gl_direct.cpp
     test_gl_world_layers.cpp  # T-701
+    test_gl_analytic_clip.cpp  # T-719
+    test_gl_channel_fold.cpp  # T-728
+    test_gl_backdrop_mask.cpp  # T-729
+    test_gl_backdrop_cache.cpp  # T-730
 )
 target_include_directories(xt_gl_tests SYSTEM PRIVATE ${PROJECT_SOURCE_DIR}/Code/SDKs/doctest)
 target_compile_definitions(xt_gl_tests PRIVATE DOCTEST_CONFIG_USE_STD_HEADERS)

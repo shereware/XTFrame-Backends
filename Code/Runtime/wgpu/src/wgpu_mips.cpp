@@ -64,6 +64,7 @@ uint32_t WgpuDevice::makeMipChain(gpu::TextureHandle tex, const void* storedLeve
         if (shared != nullptr) {
             t.texture = shared->texture;  // this entry was made before another device made the chain
             t.view = shared->view;
+            t.viewId = shared->viewId;  // T-726
             t.levels = shared->levels;
         }
         return t.levels;
@@ -185,23 +186,26 @@ uint32_t WgpuDevice::makeMipChain(gpu::TextureHandle tex, const void* storedLeve
     m_mipBytes += extraBytes;
 
     // The new texture takes the old one's place behind the same handle(s).
-    m_gpu->releaseBindGroups();  // this device's cached bind groups may name the old view
+    // T-726: the bind groups naming the old view go (the other devices' before their next submit).
     if (shared != nullptr) {
         WgpuSharedCache::Impl& c = *m_sharing->m_impl;
+        forgetView(shared->viewId, true);
         releaseTexture(shared->texture, shared->view);
         shared->texture = next;
         shared->view = makeView(next);
+        shared->viewId = detail::newViewId();
         shared->levels = levels;
         shared->bytes += extraBytes;
         c.stats.imageBytes += extraBytes;
-        ++c.viewGeneration;  // the other devices flush their bind groups before their next submit
-        m_seenViewGeneration = c.viewGeneration;
         t.texture = shared->texture;
         t.view = shared->view;
+        t.viewId = shared->viewId;
     } else {
+        forgetView(t.viewId, false);
         releaseTexture(t.texture, t.view);
         t.texture = next;
         t.view = makeView(next);
+        t.viewId = detail::newViewId();
     }
     t.levels = levels;
     return levels;

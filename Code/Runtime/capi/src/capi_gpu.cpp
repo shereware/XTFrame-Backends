@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -19,6 +20,7 @@
 #include "xt/dds.h"
 #include "xt/gpu/gpu_frame.h"
 #include "xt/gpu/image_texture.h"
+#include "xt/gpu/world_layers.h"
 #include "xt/ir.h"
 #include "xt/wgpu/wgpu_device.h"
 #include "xt/wgpu/wgpu_inflight.h"
@@ -87,6 +89,9 @@ struct xt_gpu_target {
     WGPUTextureView frameView = nullptr;  ///< the frame's view (owned for `offscreen` only)
     uint32_t attached = 0;                ///< surfaces attached (destroy refuses while > 0)
     xt::gpu::GpuFrame frame;              ///< composition scratch
+    /// T-709 (50 §50.af): which frame this is -- a number unique across all targets of the process, taken
+    /// by begin_frame (0 before the first), so a surface can tell "this frame's render_layers_gpu".
+    uint64_t frameSerial = 0;
 
     ~xt_gpu_target() {
         releaseFrame();
@@ -122,6 +127,30 @@ struct xt_gpu_target {
 
 namespace xt::capi {
 
+/// T-709 (50 §50.af item 2): the world layers of one attached surface -- a gpu::WorldLayerBuilder on the
+/// surface renderer's device (its layer targets are that device's textures), a glyph atlas of its own
+/// (the builder's text needs an atlas no other FrameBuilder uses, world_layers.h), and the composer's
+/// external-texture entries naming the layer targets that draw_layers_gpu draws with. Made by the first
+/// render_layers_gpu; released by trim, trim-on-hide, detach, destroy and set_world_layers(s, 0).
+struct SurfaceLayers {
+    gpu::WorldLayerBuilder builder;
+#ifdef XT_CAPI_GPU_ATLAS
+    std::unique_ptr<text::GlyphAtlas> atlas;
+#endif
+    /// The last build gave a layer list (count = builder.layers().size()); false = no layers.
+    bool valid = false;
+    /// One layer target as the composer samples it.
+    struct Bound {
+        gpu::TextureHandle layer = 0;  ///< the surface device's handle
+        WGPUTexture texture = nullptr;
+        WGPUTextureView view = nullptr;  ///< owned
+        gpu::TextureHandle composer = 0;
+        uint16_t width = 0, height = 0;
+    };
+    std::vector<Bound> bound;
+    std::vector<gpu::WorldLayer> quadLayers;  ///< draw_layers_gpu scratch: the layers with composer handles
+};
+
 /// The GPU resources of one attached surface: its renderer on the target's device and the texture it
 /// renders into, registered with the target's composer as an external texture.
 struct SurfaceGpu {
@@ -135,6 +164,8 @@ struct SurfaceGpu {
     gpu::TextureHandle handle = 0;
     int width = 0, height = 0;
     uint32_t executed = 0, skipped = 0;
+    /// T-709: the world layers (null until the first render_layers_gpu; never made for a flat surface).
+    std::unique_ptr<SurfaceLayers> layers;
     /// T-658: the size the renderer was last resized to (its builder and device).
     int renderWidth = 0, renderHeight = 0;
     /// T-658 (50 §50.ab item 3 ii / iii): a frame was built since these resources were made, and whether that
@@ -152,8 +183,28 @@ struct SurfaceGpu {
             target->gpus.erase(std::remove(target->gpus.begin(), target->gpus.end(), this),
                                target->gpus.end());
         }
+        releaseLayers();
         releaseTexture();
         renderer.shutdown();
+    }
+    /// T-709: the composer's entries for the layer targets (the views go too).
+    void unbindLayers() {
+        if (layers == nullptr) return;
+        for (const SurfaceLayers::Bound& b : layers->bound) {
+            if (b.composer != 0 && target != nullptr && target->composer.device() != nullptr) {
+                target->composer.device()->unregisterExternalTexture(b.composer);
+            }
+            if (b.view != nullptr) wgpuTextureViewRelease(b.view);
+        }
+        layers->bound.clear();
+    }
+    /// T-709 (50 §50.af item 2): every layer target and texture, the layers' atlas and the composer's
+    /// entries; the next render_layers_gpu makes them again.
+    void releaseLayers() {
+        if (layers == nullptr) return;
+        unbindLayers();
+        layers->builder.shutdown();  // the targets go back to the renderer's device, still alive here
+        layers.reset();
     }
     /// T-675 (50 §50.ac item 2): the texture goes back to the target's pool of surface textures.
     void releaseTexture() {
@@ -217,6 +268,7 @@ void releaseGpuResources(xt_surface& surface, bool everything) {
         // released too (the glyph atlas stays).
         SurfaceGpu& g = *surface.gpu;
         releaseGpuPoolUse(surface);  // T-685
+        g.releaseLayers();           // T-709 (50 §50.af item 2): hidden, the layer targets go
         g.releaseTexture();
         g.renderer.trim();
         g.built = false;  // the next frame is built in full (the Context reports `full` too)
@@ -383,6 +435,17 @@ xt_gpu_memory_stats collectMemoryStats(const xt_gpu_target& t) {
             m.surface_bytes += static_cast<uint64_t>(g->width) * static_cast<uint64_t>(g->height) * 4u;
         }
         m.atlas_bytes += g->renderer.stats().coverageAtlasBytes;  // T-660b: coverage atlas pages (R8)
+        if (g->layers != nullptr) {
+            // T-709 (50 §50.af item 2): the layer targets count as the surface's textures, their glyph
+            // atlas pages as atlas memory.
+            m.surface_bytes += g->layers->builder.stats().targetBytes;
+#ifdef XT_CAPI_GPU_ATLAS
+            if (g->layers->atlas != nullptr) {
+                const auto side = static_cast<uint64_t>(g->layers->atlas->textureSize());
+                m.atlas_bytes += static_cast<uint64_t>(g->layers->atlas->textureCount()) * side * side;
+            }
+#endif
+        }
 #ifdef XT_CAPI_GPU_ATLAS
         if (g->atlas != nullptr) {
             const auto side = static_cast<uint64_t>(g->atlas->textureSize());
@@ -551,6 +614,92 @@ xt_status runPreload(const char* function, xt_gpu_target* t, xt_bundle* b, const
     return XT_STATUS_OK;
 }
 
+// -- T-709 (50 §50.af): world layers. --
+
+/// The world-layer state of `s`, made (with its builder bound to the surface renderer's device and an
+/// atlas of its own) when it has none. Null when the renderer has no device.
+xt::capi::SurfaceLayers* ensureLayers(xt_surface& s) {
+    xt::capi::SurfaceGpu& g = *s.gpu;
+    if (g.layers != nullptr) return g.layers.get();
+    xt::wgpu::WgpuDevice* device = g.renderer.device();
+    if (device == nullptr) return nullptr;
+    g.layers = std::make_unique<xt::capi::SurfaceLayers>();
+    g.layers->builder.init(*device);
+#ifdef XT_CAPI_GPU_ATLAS
+    if (s.owner->ftShaper != nullptr) {
+        // The layers' own atlas (WorldLayerBuilder::setGlyphAtlas: one no other FrameBuilder uses), sized
+        // as the surface's.
+        g.layers->atlas =
+            std::make_unique<xt::text::GlyphAtlas>(*s.owner->ftShaper, kAtlasPage, kAtlasFirstPage);
+        g.layers->builder.setGlyphAtlas(g.layers->atlas.get());
+    }
+#endif
+    return g.layers.get();
+}
+
+/// Drops the composer entries whose layer target the build just made may have replaced: all of them when
+/// the build acquired a target (a new texture can reuse a released one's handle), else those whose layer
+/// is gone or names another texture now.
+void syncLayerBindings(xt::capi::SurfaceGpu& g) {
+    xt::capi::SurfaceLayers& L = *g.layers;
+    if (L.bound.empty()) return;
+    if (L.builder.stats().targetsCreated > 0 || !L.valid) {
+        g.unbindLayers();
+        return;
+    }
+    xt::wgpu::WgpuDevice* device = g.renderer.device();
+    const std::span<const xt::gpu::WorldLayer> layers = L.builder.layers();
+    for (size_t i = 0; i < L.bound.size();) {
+        const xt::capi::SurfaceLayers::Bound& b = L.bound[i];
+        const bool alive = std::any_of(layers.begin(), layers.end(), [&](const xt::gpu::WorldLayer& l) {
+            return l.texture == b.layer && l.texWidth == b.width && l.texHeight == b.height &&
+                   device != nullptr && device->texture(l.texture) == b.texture;
+        });
+        if (alive) {
+            ++i;
+            continue;
+        }
+        if (b.composer != 0 && g.target->composer.device() != nullptr) {
+            g.target->composer.device()->unregisterExternalTexture(b.composer);
+        }
+        if (b.view != nullptr) wgpuTextureViewRelease(b.view);
+        L.bound.erase(L.bound.begin() + static_cast<std::ptrdiff_t>(i));
+    }
+}
+
+/// The composer's handle of `layer`'s target (registered on first use). 0 when it cannot be had.
+xt::gpu::TextureHandle composerHandle(xt::capi::SurfaceGpu& g, const xt::gpu::WorldLayer& layer) {
+    xt::capi::SurfaceLayers& L = *g.layers;
+    xt::wgpu::WgpuDevice* device = g.renderer.device();
+    xt::wgpu::WgpuDevice* composer = g.target->composer.device();
+    if (device == nullptr || composer == nullptr) return 0;
+    WGPUTexture texture = device->texture(layer.texture);
+    if (texture == nullptr) return 0;
+    for (const xt::capi::SurfaceLayers::Bound& b : L.bound) {
+        if (b.layer == layer.texture && b.texture == texture) return b.composer;
+    }
+    xt::capi::SurfaceLayers::Bound b;
+    b.layer = layer.texture;
+    b.texture = texture;
+    b.width = layer.texWidth;
+    b.height = layer.texHeight;
+    b.view = wgpuTextureCreateView(texture, nullptr);
+    if (b.view == nullptr) return 0;
+    b.composer = composer->registerExternalTexture(b.view, layer.texWidth, layer.texHeight);
+    if (b.composer == 0) {
+        wgpuTextureViewRelease(b.view);
+        return 0;
+    }
+    L.bound.push_back(b);
+    return b.composer;
+}
+
+/// The layers of `s`'s last render_layers_gpu (empty when it has none).
+std::span<const xt::gpu::WorldLayer> surfaceLayers(const xt_surface& s) {
+    if (s.gpu == nullptr || s.gpu->layers == nullptr || !s.gpu->layers->valid) return {};
+    return s.gpu->layers->builder.layers();
+}
+
 }  // namespace
 
 extern "C" {
@@ -707,6 +856,8 @@ XT_CAPI xt_status xt_gpu_target_begin_frame(xt_gpu_target* t, const float clear_
         const std::string inflightWarning = t->inflight.takeWarning();
         if (!inflightWarning.empty()) xt::capi::log(1, "xt_gpu_target_begin_frame: " + inflightWarning);
         t->inFrame = true;
+        static std::atomic<uint64_t> frameSerials{0};  // T-709: unique across targets and threads
+        t->frameSerial = frameSerials.fetch_add(1) + 1;
         if (t->windowed()) {
             if (t->window.acquire()) {  // else: skipped (minimized, timeout)
                 t->frameTexture = t->window.frameTexture();
@@ -788,6 +939,12 @@ XT_CAPI xt_status xt_surface_render_gpu(xt_surface* s, xt_gpu_target* t, const x
     XT_CAPI_GUARD("xt_surface_render_gpu", {
         XT_CAPI_REQUIRE_SURFACE(s, "xt_surface_render_gpu");
         if (t == nullptr) return fail(XT_STATUS_INVALID_ARGUMENT, "xt_surface_render_gpu: target is NULL");
+        if (s->worldLayers) {  // T-709 (50 §50.af item 1): no single picture in world-layer output
+            return fail(
+                XT_STATUS_INVALID_ARGUMENT,
+                "xt_surface_render_gpu: the surface is in world-layer output; use "
+                "xt_surface_render_layers_gpu, or xt_surface_set_world_layers(s, 0) for a flat picture");
+        }
         if (s->renderPath == xt::capi::RenderPath::Software) {
             return fail(XT_STATUS_UNSUPPORTED,
                         "xt_surface_render_gpu: the surface renders with xt_surface_render; call "
@@ -996,6 +1153,319 @@ XT_CAPI xt_status xt_gpu_target_preload_image(xt_gpu_target* t, xt_bundle* b, co
                     XT_STATUS_NOT_FOUND,
                     std::string("xt_gpu_target_preload_image: no UI of the bundle uses '") + asset + "'");
             });
+    });
+}
+
+// -- T-709 (50 §50.af): world layers. --
+
+XT_CAPI xt_status xt_surface_set_world_layers(xt_surface* s, int enabled) {
+    XT_CAPI_GUARD("xt_surface_set_world_layers", {
+        XT_CAPI_REQUIRE_SURFACE(s, "xt_surface_set_world_layers");
+        const bool on = enabled != 0;
+        s->ctx->setWorldLayerOutput(on);
+        s->worldLayers = on;
+        if (!on) {
+            if (s->gpu != nullptr) s->gpu->releaseLayers();  // off: the layer targets go
+            s->layerFrame = 0;
+        }
+        return XT_STATUS_OK;
+    });
+}
+
+XT_CAPI xt_status xt_surface_set_world_layer_density(xt_surface* s, float density) {
+    XT_CAPI_GUARD("xt_surface_set_world_layer_density", {
+        XT_CAPI_REQUIRE_SURFACE(s, "xt_surface_set_world_layer_density");
+        if (!std::isfinite(density) || !(density > 0.0f)) {
+            return fail(XT_STATUS_INVALID_ARGUMENT,
+                        "xt_surface_set_world_layer_density: density must be > 0");
+        }
+        s->worldLayerDensity = density;
+        return XT_STATUS_OK;
+    });
+}
+
+XT_CAPI xt_status xt_surface_render_layers_gpu(xt_surface* s, xt_gpu_target* t) {
+    XT_CAPI_GUARD("xt_surface_render_layers_gpu", {
+        XT_CAPI_REQUIRE_SURFACE(s, "xt_surface_render_layers_gpu");
+        if (t == nullptr)
+            return fail(XT_STATUS_INVALID_ARGUMENT, "xt_surface_render_layers_gpu: target is NULL");
+        if (!s->worldLayers) {
+            return fail(XT_STATUS_INVALID_ARGUMENT,
+                        "xt_surface_render_layers_gpu: world layers are off (xt_surface_set_world_layers)");
+        }
+        if (s->renderPath == xt::capi::RenderPath::Software) {
+            return fail(XT_STATUS_UNSUPPORTED,
+                        "xt_surface_render_layers_gpu: the surface renders with xt_surface_render; call "
+                        "xt_surface_detach_gpu first");
+        }
+        if (s->gpuTarget != nullptr && s->gpuTarget != t) {
+            return fail(XT_STATUS_INVALID_ARGUMENT,
+                        "xt_surface_render_layers_gpu: the surface is attached to another target; call "
+                        "xt_surface_detach_gpu first");
+        }
+        if (!t->inFrame) {
+            return fail(XT_STATUS_INVALID_ARGUMENT,
+                        "xt_surface_render_layers_gpu: called outside xt_gpu_target_begin_frame / end_frame");
+        }
+        if (!s->ctx->isVisible(s->handle)) {
+            // A hidden surface paints nothing and has no layers; its resources are not (re)built (as
+            // xt_surface_render_gpu, 50 §50.aa item 4); trim-on-hide has released its layer targets.
+            xt::capi::DispatchScope scope(*s);
+            s->ctx->render(s->list, &s->damage);
+            if (s->gpu != nullptr && s->gpu->layers != nullptr) s->gpu->layers->valid = false;
+            s->layerFrame = t->frameSerial;
+            return XT_STATUS_OK;
+        }
+        if (s->gpu == nullptr) {
+            const std::string error = buildSurfaceGpu(*s, *t);
+            if (!error.empty()) return fail(XT_STATUS_INTERNAL, "xt_surface_render_layers_gpu: " + error);
+            if (s->gpuTarget == nullptr) {
+                attachSurface(*s, *t);
+            } else {
+                xt::capi::log(0, "xt_surface_render_layers_gpu: GPU resources rebuilt (" + s->uiId + ")");
+            }
+        }
+        xt::capi::SurfaceGpu& g = *s->gpu;
+        xt::capi::SurfaceLayers* L = ensureLayers(*s);
+        if (L == nullptr) {
+            return fail(XT_STATUS_INTERNAL,
+                        "xt_surface_render_layers_gpu: the surface renderer has no device");
+        }
+        // 50 §50.af item 2: the density multiplies the device pixel ratio; 1 = the list's own (the builder's
+        // 0).
+        L->builder.setDensity(s->worldLayerDensity == 1.0f ? 0.0f : s->worldLayerDensity * s->dpr);
+        xt::capi::DispatchScope scope(*s);
+        s->ctx->render(s->list, &s->damage);
+        xt::PerfTracker* perf = &s->ctx->perf();
+        const bool built =
+            L->builder.build(s->list, s->owner->shaper.get(), &s->owner->bundle->assets(), nullptr, perf);
+        L->valid = built;
+        s->layerFrame = t->frameSerial;
+        if (!built) {
+            syncLayerBindings(g);
+            switch (L->builder.status()) {
+                case xt::gpu::WorldLayerBuilder::BuildStatus::NoLayers:
+                    // Nothing painted in world-layer output this frame: no layers.
+                    return XT_STATUS_OK;
+                case xt::gpu::WorldLayerBuilder::BuildStatus::Unsupported:
+                    return fail(XT_STATUS_UNSUPPORTED,
+                                "xt_surface_render_layers_gpu: the device has no world-layer targets");
+                default:
+                    return fail(XT_STATUS_INTERNAL,
+                                std::string("xt_surface_render_layers_gpu: ") + L->builder.lastError());
+            }
+        }
+        syncLayerBindings(g);
+        xt::wgpu::WgpuDevice* device = g.renderer.device();
+        const WGPUSubmissionIndex before = device->lastSubmissionIndex();
+        L->builder.submit();
+        const xt::gpu::WorldLayerBuilder::Stats stats = L->builder.stats();
+        if (stats.submitted > 0) {
+            if (device->lastSubmissionIndex() != 0 && device->lastSubmissionIndex() != before) {
+                t->inflight.noteSubmit(device->lastSubmissionIndex());  // T-674
+            }
+            t->submits += stats.submitted;
+            t->passes += device->lastStats().passes;
+        }
+        g.executed = stats.drawCommands;
+        g.skipped = 0;
+        logSharedCache(*t);
+        if (L->builder.lastError()[0] != '\0') {
+            xt::capi::log(1, std::string("xt_surface_render_layers_gpu: ") + L->builder.lastError());
+        }
+        return XT_STATUS_OK;
+    });
+}
+
+XT_CAPI uint32_t xt_surface_world_layer_count(const xt_surface* s) {
+    XT_CAPI_GUARD_OR("xt_surface_world_layer_count", uint32_t, 0u,
+                     { return s == nullptr ? 0u : static_cast<uint32_t>(surfaceLayers(*s).size()); });
+}
+
+XT_CAPI xt_status xt_surface_world_layer_info(const xt_surface* s, uint32_t index, xt_world_layer* out) {
+    XT_CAPI_GUARD("xt_surface_world_layer_info", {
+        XT_CAPI_REQUIRE_SURFACE(s, "xt_surface_world_layer_info");
+        if (out == nullptr)
+            return fail(XT_STATUS_INVALID_ARGUMENT, "xt_surface_world_layer_info: out is NULL");
+        const std::span<const xt::gpu::WorldLayer> layers = surfaceLayers(*s);
+        if (index >= layers.size()) {
+            return fail(XT_STATUS_OUT_OF_RANGE, "xt_surface_world_layer_info: index " +
+                                                    std::to_string(index) + " >= count " +
+                                                    std::to_string(layers.size()));
+        }
+        const xt::gpu::WorldLayer& l = layers[index];
+        xt_world_layer w;
+        std::memset(&w, 0, sizeof w);
+        w.id = l.id;
+        w.order = l.order;
+        w.tex_width = l.texWidth;
+        w.tex_height = l.texHeight;
+        std::memcpy(w.world3, l.world3.m, sizeof w.world3);
+        w.rect[0] = l.rect.x;
+        w.rect[1] = l.rect.y;
+        w.rect[2] = l.rect.w;
+        w.rect[3] = l.rect.h;
+        w.opacity = l.opacity;
+        w.backface_hidden = l.backfaceHidden;
+        w.changed = l.changed;
+        // Only the fields `struct_size` covers (struct_size itself is the caller's).
+        const size_t size = std::min<size_t>(out->struct_size, sizeof w);
+        if (size > sizeof w.struct_size) {
+            std::memcpy(reinterpret_cast<uint8_t*>(out) + sizeof w.struct_size,
+                        reinterpret_cast<const uint8_t*>(&w) + sizeof w.struct_size,
+                        size - sizeof w.struct_size);
+        }
+        return XT_STATUS_OK;
+    });
+}
+
+XT_CAPI xt_status xt_surface_world_layer_readback(xt_surface* s, uint32_t index, void* rgba, int stride) {
+    XT_CAPI_GUARD("xt_surface_world_layer_readback", {
+        XT_CAPI_REQUIRE_SURFACE(s, "xt_surface_world_layer_readback");
+        const std::span<const xt::gpu::WorldLayer> layers = surfaceLayers(*s);
+        if (index >= layers.size()) {
+            return fail(XT_STATUS_OUT_OF_RANGE, "xt_surface_world_layer_readback: index " +
+                                                    std::to_string(index) + " >= count " +
+                                                    std::to_string(layers.size()));
+        }
+        const xt::gpu::WorldLayer& l = layers[index];
+        const size_t rowBytes = static_cast<size_t>(l.texWidth) * 4u;
+        if (rgba == nullptr || stride < 0 || static_cast<size_t>(stride) < rowBytes) {
+            return fail(XT_STATUS_INVALID_ARGUMENT,
+                        "xt_surface_world_layer_readback: rgba is NULL or stride < tex_width * 4");
+        }
+        xt_gpu_target* t = s->gpuTarget;
+        if (t == nullptr) return fail(XT_STATUS_INTERNAL, "xt_surface_world_layer_readback: not attached");
+        if (t->inFrame && s->layerFrame == t->frameSerial) {
+            return fail(
+                XT_STATUS_INVALID_ARGUMENT,
+                "xt_surface_world_layer_readback: call it after the xt_gpu_target_end_frame of the frame "
+                "that rendered the layers");
+        }
+        xt::wgpu::WgpuDevice* device = s->gpu->renderer.device();
+        WGPUTexture texture = device != nullptr ? device->texture(l.texture) : nullptr;
+        if (texture == nullptr) {
+            return fail(XT_STATUS_INTERNAL, "xt_surface_world_layer_readback: the layer has no texture");
+        }
+        std::vector<uint8_t> tight(rowBytes * static_cast<size_t>(l.texHeight));
+        if (!t->composer.readback(texture, std::span<uint8_t>(tight))) {
+            return fail(XT_STATUS_INTERNAL,
+                        std::string("xt_surface_world_layer_readback: ") + t->composer.lastError());
+        }
+        auto* out = static_cast<uint8_t*>(rgba);
+        for (uint32_t y = 0; y < l.texHeight; ++y) {
+            std::memcpy(out + static_cast<size_t>(y) * static_cast<size_t>(stride),
+                        tight.data() + rowBytes * y, rowBytes);
+        }
+        return XT_STATUS_OK;
+    });
+}
+
+XT_CAPI xt_status xt_surface_draw_layers_gpu(xt_surface* s, xt_gpu_target* t, const xt_rect* dest,
+                                             const float box_to_dest[16], float depth_scale) {
+    XT_CAPI_GUARD("xt_surface_draw_layers_gpu", {
+        XT_CAPI_REQUIRE_SURFACE(s, "xt_surface_draw_layers_gpu");
+        if (t == nullptr || box_to_dest == nullptr) {
+            return fail(XT_STATUS_INVALID_ARGUMENT,
+                        "xt_surface_draw_layers_gpu: target or box_to_dest is NULL");
+        }
+        if (!std::isfinite(depth_scale) || depth_scale < 0.0f) {
+            return fail(XT_STATUS_INVALID_ARGUMENT,
+                        "xt_surface_draw_layers_gpu: depth_scale must be >= 0 and finite");
+        }
+        for (int i = 0; i < 16; ++i) {
+            if (!std::isfinite(box_to_dest[i])) {
+                return fail(XT_STATUS_INVALID_ARGUMENT,
+                            "xt_surface_draw_layers_gpu: box_to_dest is not finite");
+            }
+        }
+        if (!s->worldLayers) {
+            return fail(XT_STATUS_INVALID_ARGUMENT,
+                        "xt_surface_draw_layers_gpu: world layers are off (xt_surface_set_world_layers)");
+        }
+        if (!t->inFrame) {
+            return fail(XT_STATUS_INVALID_ARGUMENT,
+                        "xt_surface_draw_layers_gpu: called outside xt_gpu_target_begin_frame / end_frame");
+        }
+        if ((s->gpuTarget != nullptr && s->gpuTarget != t) || s->layerFrame != t->frameSerial) {
+            return fail(
+                XT_STATUS_INVALID_ARGUMENT,
+                "xt_surface_draw_layers_gpu: call xt_surface_render_layers_gpu on this target in this "
+                "frame first");
+        }
+        const xt_rect rect = dest != nullptr ? *dest : xt_rect{0, 0, t->width, t->height};
+        if (rect.w <= 0 || rect.h <= 0) {
+            return fail(XT_STATUS_INVALID_ARGUMENT, "xt_surface_draw_layers_gpu: dest has no area");
+        }
+        const std::span<const xt::gpu::WorldLayer> layers = surfaceLayers(*s);
+        if (layers.empty() || t->frameView == nullptr) return XT_STATUS_OK;  // nothing, or a skipped frame
+        const int cx0 = std::clamp(rect.x, 0, t->width), cy0 = std::clamp(rect.y, 0, t->height);
+        const int cx1 =
+            static_cast<int>(std::clamp<int64_t>(static_cast<int64_t>(rect.x) + rect.w, 0, t->width));
+        const int cy1 =
+            static_cast<int>(std::clamp<int64_t>(static_cast<int64_t>(rect.y) + rect.h, 0, t->height));
+        if (cx1 <= cx0 || cy1 <= cy0) return XT_STATUS_OK;  // entirely outside the target
+        // dest's offset x box_to_dest x scale(1, 1, depth_scale): root box -> homogeneous target pixels.
+        xt::Mat4 m;
+        std::memcpy(m.m, box_to_dest, sizeof m.m);
+        for (int r = 0; r < 4; ++r) m.m[r * 4 + 2] *= depth_scale;
+        for (int c = 0; c < 4; ++c) {
+            m.m[c] += static_cast<float>(rect.x) * m.m[12 + c];
+            m.m[4 + c] += static_cast<float>(rect.y) * m.m[12 + c];
+        }
+        xt::capi::SurfaceGpu& g = *s->gpu;
+        xt::capi::SurfaceLayers& L = *g.layers;
+        L.quadLayers.assign(layers.begin(), layers.end());
+        for (xt::gpu::WorldLayer& l : L.quadLayers) l.texture = composerHandle(g, l);  // 0: left out
+        xt::gpu::buildWorldLayerQuads(L.quadLayers, m, t->width, t->height, /*clear=*/false, t->frame);
+        if (t->frame.cmds.empty()) return XT_STATUS_OK;
+        for (xt::gpu::DrawCmd& cmd : t->frame.cmds) {  // the quads stay inside dest
+            cmd.clipX = static_cast<int16_t>(std::min(cx0, 32767));
+            cmd.clipY = static_cast<int16_t>(std::min(cy0, 32767));
+            cmd.clipW = static_cast<int16_t>(std::min(cx1 - cx0, 32767));
+            cmd.clipH = static_cast<int16_t>(std::min(cy1 - cy0, 32767));
+        }
+        const std::string error = submitComposite(*t);
+        if (!error.empty()) return fail(XT_STATUS_INTERNAL, "xt_surface_draw_layers_gpu: " + error);
+        return XT_STATUS_OK;
+    });
+}
+
+XT_CAPI xt_status xt_surface_push_input_ray(xt_surface* s, const xt_input_event* e, const float origin[3],
+                                            const float direction[3]) {
+    XT_CAPI_GUARD("xt_surface_push_input_ray", {
+        XT_CAPI_REQUIRE_SURFACE(s, "xt_surface_push_input_ray");
+        if (e == nullptr || e->struct_size < sizeof(xt_input_event) || origin == nullptr ||
+            direction == nullptr) {
+            return fail(
+                XT_STATUS_INVALID_ARGUMENT,
+                "xt_surface_push_input_ray: event, origin or direction is NULL, or struct_size too small");
+        }
+        if (e->kind != XT_INPUT_POINTER_MOVE && e->kind != XT_INPUT_POINTER_DOWN &&
+            e->kind != XT_INPUT_POINTER_UP && e->kind != XT_INPUT_WHEEL) {
+            return fail(
+                XT_STATUS_INVALID_ARGUMENT,
+                "xt_surface_push_input_ray: kind must be POINTER_MOVE, POINTER_DOWN, POINTER_UP or WHEEL");
+        }
+        for (int i = 0; i < 3; ++i) {
+            if (!std::isfinite(origin[i]) || !std::isfinite(direction[i])) {
+                return fail(XT_STATUS_INVALID_ARGUMENT, "xt_surface_push_input_ray: the ray is not finite");
+            }
+        }
+        if (direction[0] == 0.0f && direction[1] == 0.0f && direction[2] == 0.0f) {
+            return fail(XT_STATUS_INVALID_ARGUMENT, "xt_surface_push_input_ray: direction is zero");
+        }
+        if (!s->worldLayers) {
+            return fail(XT_STATUS_INVALID_ARGUMENT,
+                        "xt_surface_push_input_ray: world layers are off (xt_surface_set_world_layers)");
+        }
+        xt::InputEvent event;
+        if (!xt::capi::convertInput(*e, event, "xt_surface_push_input_ray"))
+            return XT_STATUS_INVALID_ARGUMENT;
+        s->ctx->pushPointerRay(event, xt::Vec3{origin[0], origin[1], origin[2]},
+                               xt::Vec3{direction[0], direction[1], direction[2]});
+        ++s->debugInputCount;
+        return XT_STATUS_OK;
     });
 }
 

@@ -6,6 +6,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <vector>
 
 #include "xt/command_list.h"
 #include "xt/damage.h"
@@ -48,6 +49,11 @@ struct WgpuHeadlessOptions {
     /// T-636 (50 §50.z `xt_gpu_target_desc::backend`): vulkan|d3d12|metal|gl in place of
     /// XT_WGPU_BACKEND; empty = read XT_WGPU_BACKEND as before. Any other name fails.
     std::string backend;
+    /// T-734 (Docs/design/10-backends.md §10.19): also require WGPUFeatureName_TimestampQuery (and
+    /// WGPUNativeFeature_TimestampQueryInsideEncoders) when the adapter has them, for
+    /// `WgpuRenderer::setGpuTiming`; `WgpuInit::notes` says which. False (the default) requests the
+    /// same features as before.
+    bool gpuTiming = false;
 };
 
 /// What `WgpuRenderer::init` draws with: a device and its queue (the renderer takes its own
@@ -134,6 +140,22 @@ struct WgpuStats {
     uint32_t clipScissor = 0;      ///< drawn as a scissor
     uint32_t clipImageDirect = 0;  ///< one image drawn as a fringed convex polygon
     uint32_t clipMaskLayers = 0;   ///< drawn as a mask layer
+    // T-718 (Docs/design/10-backends.md §10.16 W1 item 8; gpu::FrameBuilder::lastBuildStats): rounded
+    // clips drawn as analytic clip levels, and clips that fell back to a mask layer (another shape,
+    // or a fourth nested level); zeros for a reused frame.
+    uint32_t analyticClips = 0;
+    uint32_t analyticClipFallbacks = 0;
+    // T-721 / T-730 (Docs/design/10-backends.md §10.16 W2, §10.18 B; gpu::FrameBuilder::lastBuildStats):
+    // effect cache hits a fraction of a pixel away and segments drawn again at rest; backdrop pairs
+    // served from the cache, drawn in full and stored; zeros for a reused frame ...
+    uint32_t effectCachePhaseHits = 0;
+    uint32_t effectCacheSettles = 0;
+    uint32_t backdropPairHits = 0;
+    uint32_t backdropPairMisses = 0;
+    uint32_t backdropPairStores = 0;
+    // ... and what the effect cache holds after the last build (kept for a reused frame).
+    uint64_t effectCacheBytes = 0;
+    uint32_t effectCacheEntries = 0;
 
     // T-674 (Docs/design/50-c-abi.md §50.ac item 1): the waits of the last `framesInFlight().beginFrame`
     // (0 when the GPU was at most two frames behind) and their milliseconds.
@@ -146,6 +168,17 @@ struct WgpuStats {
     uint32_t prewarmPipelineCreates = 0;
     uint32_t shaderCompiles = 0;
     uint32_t pipelineCreates = 0;
+};
+
+/// T-734 (Docs/design/10-backends.md §10.19): the GPU timestamps of one frame
+/// (`WgpuRenderer::takeGpuTimings`).
+struct WgpuGpuTiming {
+    uint64_t frame = 0;    ///< renderer's own frame counter, counted per render() call from 0
+    double spanMs = 0;     ///< first timestamp of the frame to the last
+    double passSumMs = 0;  ///< sum over the frame's render/compute passes of (end - begin)
+    uint32_t passes = 0;   ///< passes timed
+    bool encoderLevel =
+        false;  ///< span came from encoder timestamps (else first pass begin .. last pass end)
 };
 
 class WgpuRenderer {
@@ -233,6 +266,23 @@ public:
     /// notes its submission index here. Its frames begin and end only when the host calls
     /// `beginFrame` / `endFrame` (Code/Backends/xt_renderer_wgpu.cpp); `shutdown` resets it.
     WgpuFramesInFlight& framesInFlight();
+
+    /// Diagnostics (10 §10.19): off by default. Returns false (and stays off) when the device lacks
+    /// WGPUFeatureName_TimestampQuery. While on, the frame encoder of every `render` / `submit` gets
+    /// timestamps (wgpu_timing.h: the encoder's start and end when the device has
+    /// TimestampQueryInsideEncoders, and each render pass's begin and end); a frame that encodes no
+    /// render pass gives no result. Off: no query set exists and nothing extra is encoded.
+    /// `shutdown` turns it off.
+    bool setGpuTiming(bool on);
+    bool gpuTimingEnabled() const;
+    /// Non-blocking: moves the results of frames whose timestamps have been read back, oldest first.
+    /// Call wgpuDevicePoll (or any later frame) to make progress; never waits itself.
+    size_t takeGpuTimings(std::vector<WgpuGpuTiming>& out);
+    /// Frames not timed because every readback slot was still mapping (or the query set was too
+    /// small), plus unread results pushed out of the full result queue.
+    uint64_t gpuTimingDropped() const;
+    /// For tests: whether the renderer holds a timestamp query set (never while timing is off).
+    bool gpuTimingHasQuerySet() const;
 
 private:
     struct Impl;

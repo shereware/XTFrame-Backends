@@ -537,11 +537,12 @@ TEST_CASE("wgpu: live non-sampler bindings are counted per device (T-670)") {
     Target target(xt::wgpu::test::sharedInit().device, 16, 16, WGPUTextureFormat_RGBA8Unorm);
     r.resize(16, 16);
 
-    // Group 0 / group 1 (one uniform buffer each) and the solid draw's texture group (3 views).
+    // Group 0 (one uniform buffer binding), group 1 (two: the parameter block and, T-718, the analytic
+    // clip block) and the solid draw's texture group (3 views).
     submitQuad(dev, target.view, xt::gpu::Shading::Solid, 0);
     REQUIRE_MESSAGE(dev.lastError().empty(), dev.lastError());
     const uint32_t base = dev.lastStats().liveBindings;
-    CHECK(base == 2u + 3u);
+    CHECK(base == 3u + 3u);
     CHECK(dev.lastStats().peakBindings >= base);
 
     // A texture draw adds one cached group of 3 views.
@@ -563,4 +564,73 @@ TEST_CASE("wgpu: live non-sampler bindings are counted per device (T-670)") {
     CHECK(dev.lastStats().liveBindings == base);
     CHECK(dev.lastStats().peakBindings >= withTexture);
     CHECK(dev.lastStats().peakBindings >= dev.lastStats().liveBindings);
+}
+
+TEST_CASE("wgpu: debug labels are off unless XT_WGPU_LABELS=1, and the notes say so (T-726)") {
+#if defined(_WIN32)
+    size_t envLen = 0;
+    char env[8] = {0};
+    const bool set = getenv_s(&envLen, env, sizeof(env), "XT_WGPU_LABELS") == 0 && envLen > 1;
+    const bool on = set && std::strcmp(env, "1") == 0;
+#else
+    const char* env = std::getenv("XT_WGPU_LABELS");
+    const bool on = env != nullptr && std::strcmp(env, "1") == 0;
+#endif
+    CHECK(xt::wgpu::labelsEnabled() == on);
+    const std::string& notes = xt::wgpu::test::sharedInit().notes;
+    CHECK(notes.find(on ? "labels on (XT_WGPU_LABELS)" : "labels off (XT_WGPU_LABELS)") != std::string::npos);
+}
+
+TEST_CASE("wgpu: destroying a texture removes only its bind groups; a new view never matches them (T-726)") {
+    WgpuRenderer r;
+    REQUIRE(r.init(withSamples(1)));
+    WgpuDevice& dev = *r.device();
+    Target target(xt::wgpu::test::sharedInit().device, 16, 16, WGPUTextureFormat_RGBA8Unorm);
+    r.resize(16, 16);
+    submitQuad(dev, target.view, xt::gpu::Shading::Solid, 0);
+    REQUIRE_MESSAGE(dev.lastError().empty(), dev.lastError());
+    const uint32_t base = dev.lastStats().liveBindings;  // the uniform groups and the solid group
+
+    std::vector<uint8_t> texels(4 * 4 * 4, 0xFF);
+    for (size_t i = 0; i < texels.size(); i += 4) texels[i + 1] = texels[i + 2] = 0;  // red
+    const xt::gpu::TextureHandle a =
+        dev.createTexture("t726 a", 4, 4, xt::gpu::TextureFormat::Rgba8, texels.data());
+    REQUIRE(a != 0);
+    submitQuad(dev, target.view, xt::gpu::Shading::Texture, a);
+    REQUIRE_MESSAGE(dev.lastError().empty(), dev.lastError());
+    CHECK(dev.lastStats().bindGroups == 1u);
+    CHECK(dev.lastStats().liveBindings == base + 3u);
+    submitQuad(dev, target.view, xt::gpu::Shading::Texture, a);
+    CHECK(dev.lastStats().bindGroups == 0u);  // cached
+
+    // The texture goes: exactly its group goes (counted), the solid group stays cached.
+    dev.destroyTexture(a);
+    submitQuad(dev, target.view, xt::gpu::Shading::Solid, 0);
+    REQUIRE_MESSAGE(dev.lastError().empty(), dev.lastError());
+    CHECK(dev.lastStats().bindGroupEvictions == 1u);
+    CHECK(dev.lastStats().bindGroups == 0u);
+    CHECK(dev.lastStats().liveBindings == base);
+
+    // New textures take the destroyed handle slot (and, typically, a recycled address): each draw makes a
+    // group of its own and shows its own texels, never the destroyed red ones.
+    for (size_t i = 0; i < texels.size(); i += 4) {
+        texels[i] = 0;
+        texels[i + 1] = 0xFF;
+    }
+    for (int i = 0; i < 4; ++i) {
+        const xt::gpu::TextureHandle b =
+            dev.createTexture("t726 b", 4, 4, xt::gpu::TextureFormat::Rgba8, texels.data());
+        REQUIRE(b != 0);
+        submitQuad(dev, target.view, xt::gpu::Shading::Texture, b);
+        REQUIRE_MESSAGE(dev.lastError().empty(), dev.lastError());
+        CHECK(dev.lastStats().bindGroups == 1u);
+        std::vector<uint8_t> px(16 * 16 * 4);
+        REQUIRE(r.readback(target.texture, px));
+        CHECK(px[0] == 0);
+        CHECK(px[1] == 255);
+        dev.destroyTexture(b);
+        submitQuad(dev, target.view, xt::gpu::Shading::Solid, 0);
+        CHECK(dev.lastStats().bindGroupEvictions == 1u);
+        CHECK(dev.lastStats().liveBindings == base);
+    }
 }

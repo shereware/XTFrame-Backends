@@ -27,5 +27,5 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     let u = (t * (lutWidth - 1.0) + 0.5) / lutWidth;
     let c = tex0(vec2f(u, 0.5));
     let a = c.a * paintAlpha * in.color.a;
-    return vec4f(c.rgb * a, a);
+    return vec4f(c.rgb * a, a) * clipCoverage(in.px);  // T-718: 1 without an analytic clip
 }

@@ -104,6 +104,7 @@ uint32_t paramFloats(const gpu::DrawCmd& cmd) {
                 case EffectProgram::LevelMix:
                     return sizeof(gpu::LevelMixParams) / sizeof(float);
                 case EffectProgram::Backdrop:
+                case EffectProgram::BackdropMasked:  // T-729: BackdropParams is read here, not uploaded
                 case EffectProgram::None:
                 default:
                     return 0;
@@ -385,8 +386,8 @@ void WgpuDevice::resize(int width, int height) {
         return;
     }
     // Cached targets are window-sized: a resize invalidates every size (the builder flushes).
-    if (m_gpu && !m_ownCachedFree.empty()) m_gpu->releaseBindGroups();
     for (FreeCached& f : m_ownCachedFree) {
+        forgetView(f.texture.viewId, false);  // T-726
         releaseTextureEntry(f.texture);
     }
     m_ownCachedFree.clear();
@@ -417,15 +418,6 @@ uint32_t WgpuDevice::poolFrame() const {
 
 uint64_t WgpuDevice::poolBudget() const {
     return m_sharing != nullptr ? m_sharing->m_impl->transientBudget : m_poolBudget;
-}
-
-void WgpuDevice::noteViewsDestroyed() {
-    if (m_gpu) m_gpu->releaseBindGroups();  // the cached bind groups may name the views
-    if (m_sharing != nullptr) {
-        WgpuSharedCache::Impl& c = *m_sharing->m_impl;
-        ++c.viewGeneration;
-        m_seenViewGeneration = c.viewGeneration;
-    }
 }
 
 void WgpuDevice::countTextureCreate() {
@@ -465,6 +457,16 @@ WGPUTextureView WgpuDevice::viewOf(const Texture& t) const {
         }
     }
     return t.view;
+}
+
+uint64_t WgpuDevice::viewIdOf(const Texture& t) const {
+    if (t.sharedId != 0 && m_sharing != nullptr) {
+        const WgpuSharedCache::Impl::Image& image = m_sharing->m_impl->images[t.sharedId - 1];
+        if (image.view != nullptr) {
+            return image.viewId;
+        }
+    }
+    return t.viewId;
 }
 
 void WgpuDevice::releaseTextureEntry(Texture& t) {
@@ -507,6 +509,7 @@ gpu::TextureHandle WgpuDevice::createTexture(const char* debugName, uint16_t w, 
     Texture t;
     t.texture = texture;
     t.view = makeView(texture);
+    t.viewId = detail::newViewId();  // T-726
     t.format = fmt;
     t.width = w;
     t.height = h;
@@ -564,7 +567,7 @@ void WgpuDevice::destroyTexture(gpu::TextureHandle tex) {
         dropSharedUse(tex, false);  // T-648: as releaseSharedImage(tex, false)
         return;
     }
-    m_gpu->releaseBindGroups();  // the cached bind groups may name its view
+    forgetView(t->viewId, t->cached);  // T-726: a cached target may have served other devices before
     releaseTextureEntry(m_textures[tex - 1]);
     m_freeTextures.push_back(tex);
 }
@@ -590,7 +593,8 @@ gpu::TextureHandle WgpuDevice::findSharedImage(const gpu::ImageKey& key, uint16_
     t.height = h;
     t.external = true;
     t.sharedId = id;
-    c.useImage(id);  // T-656: off the idle list
+    t.viewId = image.viewId;  // T-726
+    c.useImage(id);           // T-656: off the idle list
     return addTexture(t);
 }
 
@@ -605,6 +609,7 @@ gpu::TextureHandle WgpuDevice::createSharedImage(const gpu::ImageKey& key, const
     const uint64_t bytes = isCompressed(fmt) ? uint64_t((w + 3u) / 4u) * ((h + 3u) / 4u) * unitBytes(fmt)
                                              : uint64_t(w) * h * unitBytes(fmt);
     t.sharedId = m_sharing->m_impl->addImage(key, w, h, fmt, t.texture, t.view, bytes);
+    m_sharing->m_impl->images[t.sharedId - 1].viewId = t.viewId;  // T-726: the view keeps its id
     t.external = true;
     return handle;
 }
@@ -623,8 +628,8 @@ void WgpuDevice::releaseSharedImage(gpu::TextureHandle tex, bool keep) {
 
 void WgpuDevice::dropSharedUse(gpu::TextureHandle tex, bool keep) {
     const uint32_t id = m_textures[tex - 1].sharedId;
-    m_gpu->releaseBindGroups();                // the cached bind groups may name its view
-    releaseTextureEntry(m_textures[tex - 1]);  // external: the view stays with the cache
+    forgetView(viewIdOf(m_textures[tex - 1]), false);  // T-726: the cache logs it when it destroys it
+    releaseTextureEntry(m_textures[tex - 1]);          // external: the view stays with the cache
     m_freeTextures.push_back(tex);
     if (m_sharing != nullptr) {
         m_sharing->m_impl->releaseImage(id, keep);
@@ -647,6 +652,7 @@ gpu::TextureHandle WgpuDevice::registerExternalTexture(WGPUTextureView view, uin
     }
     Texture t;
     t.view = view;
+    t.viewId = detail::newViewId();  // T-726
     t.width = width;
     t.height = height;
     t.external = true;
@@ -684,6 +690,7 @@ gpu::TextureHandle WgpuDevice::acquireCachedTarget(uint16_t w, uint16_t h, gpu::
         releaseTexture(t.texture, t.view);
         return 0;
     }
+    t.viewId = detail::newViewId();  // T-726
     t.width = w;
     t.height = h;
     t.cached = true;
@@ -707,7 +714,7 @@ void WgpuDevice::trimCachedFree() {
         // T-675: the target's list and budget; the other devices flush by the view generation.
         WgpuSharedCache::Impl& c = *m_sharing->m_impl;
         c.trimCachedFree();
-        if (m_seenViewGeneration != c.viewGeneration) noteViewsDestroyed();
+        syncSharedViews();  // T-726: the ids it destroyed
         return;
     }
     while (m_ownCachedFreeBytes > kCachedFreeBudgetBytes && !m_ownCachedFree.empty()) {
@@ -718,7 +725,7 @@ void WgpuDevice::trimCachedFree() {
         Texture t = m_ownCachedFree[oldest].texture;
         m_ownCachedFree.erase(m_ownCachedFree.begin() + static_cast<std::ptrdiff_t>(oldest));
         m_ownCachedFreeBytes -= uint64_t(t.width) * t.height * 4u;
-        if (m_gpu) m_gpu->releaseBindGroups();
+        forgetView(t.viewId, false);  // T-726
         releaseTextureEntry(t);
     }
 }
@@ -873,6 +880,7 @@ int WgpuDevice::acquirePooled(const gpu::TransientTargetDesc& desc) {
     for (WGPUTexture made : {p.color, p.resolve, p.depthStencil}) {
         if (made != nullptr) countTextureCreate();  // T-675
     }
+    p.viewId = detail::newViewId();  // T-726
     const uint64_t px = uint64_t(desc.width) * desc.height;
     p.bytes = px * (samples * 4u + (samples > 1 ? 4u : 0u) + (stencil ? samples * m_stencilTexelBytes : 0u));
     p.inUse = true;
@@ -906,7 +914,7 @@ void WgpuDevice::trimPool() {
     }
     if (m_sharing == nullptr) {
         auto erase = [this, &entries, &live, &liveCount](size_t i) {
-            m_gpu->releaseBindGroups();  // the cached bind groups may name its views
+            forgetView(entries[i].viewId, false);  // T-726: the cached bind groups naming its view
             live -= entries[i].bytes;
             --liveCount;
             releasePooled(entries[i]);
@@ -980,6 +988,13 @@ WGPUTextureView WgpuDevice::sampleView(gpu::TargetHandle t) const {
     }
     const Pooled& p = pool()[static_cast<size_t>(m_frameTargets[t - 1])];
     return p.resolveView != nullptr ? p.resolveView : p.colorView;
+}
+
+uint64_t WgpuDevice::sampleViewId(gpu::TargetHandle t) const {
+    if (t == gpu::kSurfaceTarget || t > m_frameTargets.size() || m_frameTargets[t - 1] < 0) {
+        return 0;
+    }
+    return pool()[static_cast<size_t>(m_frameTargets[t - 1])].viewId;
 }
 
 // -------------------------------------------------------------------------------------------
@@ -1121,6 +1136,7 @@ void WgpuDevice::planFrame(const gpu::GpuFrame& frame) {
         m_cmdParamOffsets[c] = offset;
         byIndex.emplace(cmd.paramIndex, offset);
     }
+    planClipBlocks(frame);  // T-718
     // The last binding reads kParamBlockBytes from its offset.
     m_uniformData.resize(m_uniformData.size() + kZeroBlockFloats, 0.0f);
 }
@@ -1139,11 +1155,7 @@ void WgpuDevice::submit(const gpu::GpuFrame& frame) {
     auto t0 = Clock::now();
     m_frame = &frame;
     ++m_frameCounter;
-    if (m_sharing != nullptr && m_seenViewGeneration != m_sharing->m_impl->viewGeneration) {
-        // T-675: another device of the target destroyed pooled views these bind groups may name.
-        m_gpu->releaseBindGroups();
-        m_seenViewGeneration = m_sharing->m_impl->viewGeneration;
-    }
+    syncSharedViews();  // T-675 / T-726: views another device of the target destroyed
     for (Pooled& p : pool()) {
         p.inUse = false;
     }
@@ -1181,7 +1193,8 @@ void WgpuDevice::submit(const gpu::GpuFrame& frame) {
         // cached blit groups, which bind it too, go). T-457: compared by generation, not by handle:
         // the grown buffer's handle may reuse the address of the one just released, which left the
         // groups bound to the old, smaller buffer (Vulkan, challenge-menu: offset 65536 into 64 KB).
-        g.releaseBindGroups();
+        // T-726: only the blit groups bind it; the texture groups stay.
+        m_evictedBindGroups += g.evictLayout(g.pipelines->blitLayout());
         if (g.passGroup != nullptr) wgpuBindGroupRelease(g.passGroup);
         if (g.paramGroup != nullptr) wgpuBindGroupRelease(g.paramGroup);
         WGPUBindGroupEntry e = WGPU_BIND_GROUP_ENTRY_INIT;
@@ -1193,17 +1206,22 @@ void WgpuDevice::submit(const gpu::GpuFrame& frame) {
         d.entryCount = 1;
         d.entries = &e;
         g.passGroup = wgpuDeviceCreateBindGroup(m_device, &d);
-        e.size = detail::kParamBlockBytes;
+        WGPUBindGroupEntry pe[2] = {e, e};  // T-718: the parameter block and the analytic clip block
+        pe[0].size = detail::kParamBlockBytes;
+        pe[1].binding = 1;
+        pe[1].size = detail::kClipBlockBytes;
         d.layout = g.pipelines->paramLayout();
+        d.entryCount = 2;
+        d.entries = pe;
         g.paramGroup = wgpuDeviceCreateBindGroup(m_device, &d);
-        g.uniformBindings = 2;  // T-670: one uniform buffer each
+        g.uniformBindings = 3;  // T-670: one uniform buffer binding each (T-718: two in group 1)
         g.noteBindings();
         g.groupsGeneration = g.uniforms.generation;
     }
     m_stats.uploadMs = msSince(t0);
     t0 = Clock::now();
     const bool surfaceOk = m_surface != nullptr && ensureSurfaceAttachments();
-    WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(m_device, nullptr);
+    WGPUCommandEncoder enc = createFrameEncoder();  // T-734: through the GPU timer, if any
     bool surfaceStarted = false;
     // T-457: every dynamic offset of this frame is below the uploaded size, so a buffer at least that
     // large keeps them all in range; anything else (a failed growth) skips the frame's draws.
@@ -1235,7 +1253,7 @@ void WgpuDevice::submit(const gpu::GpuFrame& frame) {
         WGPURenderPassDescriptor rp = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
         rp.colorAttachmentCount = 1;
         rp.colorAttachments = &ca;
-        WGPURenderPassEncoder p = wgpuCommandEncoderBeginRenderPass(enc, &rp);
+        WGPURenderPassEncoder p = beginRenderPass(enc, rp);
         wgpuRenderPassEncoderEnd(p);
         wgpuRenderPassEncoderRelease(p);
         ++m_stats.passes;
@@ -1244,7 +1262,7 @@ void WgpuDevice::submit(const gpu::GpuFrame& frame) {
     }
     m_stats.encodeMs = msSince(t0);
     t0 = Clock::now();
-    WGPUCommandBuffer cb = wgpuCommandEncoderFinish(enc, nullptr);
+    WGPUCommandBuffer cb = finishFrameEncoder(enc);
     m_lastSubmission = wgpuQueueSubmitForIndex(m_queue, 1, &cb);  // T-674: frames in flight
     wgpuCommandBufferRelease(cb);
     wgpuCommandEncoderRelease(enc);
@@ -1253,6 +1271,8 @@ void WgpuDevice::submit(const gpu::GpuFrame& frame) {
     if (m_sharing != nullptr) releaseSurfaceAttachments();  // T-675: borrowed for this submit only
 
     trimPool();
+    m_stats.bindGroupEvictions = m_evictedBindGroups;  // T-726: since the previous submit's end
+    m_evictedBindGroups = 0;
     m_stats.cachedTargets = static_cast<uint32_t>(cachedFree().size());
     for (const Texture& t : m_textures) {
         if (t.cached && t.view != nullptr) ++m_stats.cachedTargets;
@@ -1352,7 +1372,7 @@ void WgpuDevice::encodePass(WGPUCommandEncoder enc, size_t index, bool& surfaceS
         ca.clearValue = c;
         WGPURenderPassDepthStencilAttachment ds = WGPU_RENDER_PASS_DEPTH_STENCIL_ATTACHMENT_INIT;
         WGPURenderPassDescriptor rp = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
-        rp.label = label("xt_wgpu pass");
+        if (labelsEnabled()) rp.label = label("xt_wgpu pass");  // T-726
         rp.colorAttachmentCount = 1;
         rp.colorAttachments = &ca;
         if (stencil != nullptr) {
@@ -1365,7 +1385,16 @@ void WgpuDevice::encodePass(WGPUCommandEncoder enc, size_t index, bool& surfaceS
         ++m_stats.passes;
         if (clear) ++m_stats.clears;
         if (resolve != nullptr && view == m_surfaceMsaaView) ++m_stats.resolves;
-        return wgpuCommandEncoderBeginRenderPass(enc, &rp);
+        return beginRenderPass(enc, rp);
+    };
+
+    // The cache stores attached to this pass, after its last command.
+    auto storeCaches = [&]() {
+        for (const gpu::CacheStore& store : frame.cacheStores) {
+            if (store.pass == index) {
+                executeCacheStore(enc, store);
+            }
+        }
     };
 
     if (plan.copyMode == 1) {
@@ -1387,11 +1416,18 @@ void WgpuDevice::encodePass(WGPUCommandEncoder enc, size_t index, bool& surfaceS
         const WGPUExtent3D size{static_cast<uint32_t>(plan.copyW), static_cast<uint32_t>(plan.copyH), 1};
         wgpuCommandEncoderCopyTextureToTexture(enc, &s, &d, &size);
         ++m_stats.copies;
+        // T-728 (Docs/design/10-backends.md §10.18 A item 2): a copy pass with no draw command and
+        // no clear (a backdrop pyramid's base copied from a transient) needs no render pass after
+        // the copy -- an empty one only loads and stores the target. Its cache stores still run.
+        if (pass.clear == 0 && pass.cmdCount == 0) {
+            storeCaches();
+            return;
+        }
     }
     if (loadHost) {
         // Pre-pass: the host's surface into the 4x attachment (blit.wgsl, zero offset).
         WGPURenderPassEncoder p = begin(m_surfaceMsaaView, nullptr, nullptr, true, transparent, false);
-        blit(p, m_surface, 0, 0, 0, static_cast<int>(tw), static_cast<int>(th), format, samples, false, tw,
+        blit(p, m_surface, 0, 0, 0, 0, static_cast<int>(tw), static_cast<int>(th), format, samples, false, tw,
              th);
         wgpuRenderPassEncoderEnd(p);
         wgpuRenderPassEncoderRelease(p);
@@ -1402,8 +1438,8 @@ void WgpuDevice::encodePass(WGPUCommandEncoder enc, size_t index, bool& surfaceS
     if (plan.copyMode == 2) {
         WGPUTextureView src = sampleView(pass.copySource);
         if (src != nullptr) {
-            blit(rp, src, plan.blitOffset, plan.dstX, plan.dstY, plan.copyW, plan.copyH, format, samples,
-                 stencilView != nullptr, tw, th);
+            blit(rp, src, sampleViewId(pass.copySource), plan.blitOffset, plan.dstX, plan.dstY, plan.copyW,
+                 plan.copyH, format, samples, stencilView != nullptr, tw, th);
             ++m_stats.blits;
         } else {
             ++m_stats.skippedCopies;
@@ -1433,11 +1469,7 @@ void WgpuDevice::encodePass(WGPUCommandEncoder enc, size_t index, bool& surfaceS
     }
     wgpuRenderPassEncoderEnd(rp);
     wgpuRenderPassEncoderRelease(rp);
-    for (const gpu::CacheStore& store : frame.cacheStores) {
-        if (store.pass == index) {
-            executeCacheStore(enc, store);
-        }
-    }
+    storeCaches();
 }
 
 void WgpuDevice::executeCacheStore(WGPUCommandEncoder enc, const gpu::CacheStore& store) {

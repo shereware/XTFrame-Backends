@@ -1,19 +1,48 @@
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 
 #include "wgpu_internal.h"
 
-/// The frame's geometry buffers (T-438, Docs/design/10-backends.md §10.10.2 first row): three
-/// rotating sets, each written against its own CPU shadow so only changed element runs go through
-/// wgpuQueueWriteBuffer -- gl_geometry.cpp's T-159 strategy with WebGPU writes.
+/// The frame's geometry buffers (T-438, Docs/design/10-backends.md §10.10.2 first row), each written
+/// against its own CPU shadow so only changed element runs go through wgpuQueueWriteBuffer --
+/// gl_geometry.cpp's T-159 strategy with WebGPU writes. T-726: one set, compared with the previous
+/// frame. wgpuQueueWriteBuffer is a queue operation: it takes effect after every command buffer
+/// submitted before it and before every one submitted after it, so a write for the next frame never
+/// changes what a frame still in flight reads; a buffer replaced by a larger one is destroyed by wgpu
+/// only once the submissions using it are done -- the single uniform buffer has always worked this way.
 
 namespace xt::wgpu::detail {
 
 namespace {
-/// Two changed runs closer than this many bytes are written as one (gl_geometry.cpp).
-constexpr size_t kMergeGapBytes = 1024;
+/// T-726: two changed runs closer than this many bytes are written as one; XT_WGPU_UPLOAD_MERGE_GAP
+/// overrides it (bytes, read once). Measured on War Table: 256 B / 64 B write 7-15 % fewer bytes than
+/// 1 KB but cost 0.15-0.5 ms more CPU per frame in the extra writeBuffer calls.
+constexpr size_t kDefaultMergeGapBytes = 1024;
 /// Buffers grow in this many bytes.
 constexpr uint64_t kCapacityStep = 64 * 1024;
+
+size_t mergeGapBytes() {
+    static const size_t gap = [] {
+#if defined(_MSC_VER)
+        size_t len = 0;
+        char buf[32] = {0};
+        if (getenv_s(&len, buf, sizeof(buf), "XT_WGPU_UPLOAD_MERGE_GAP") != 0 || len <= 1) {
+            return kDefaultMergeGapBytes;
+        }
+        const char* text = buf;
+#else
+        const char* text = std::getenv("XT_WGPU_UPLOAD_MERGE_GAP");
+        if (text == nullptr || *text == '\0') {
+            return kDefaultMergeGapBytes;
+        }
+#endif
+        char* end = nullptr;
+        const unsigned long v = std::strtoul(text, &end, 10);
+        return (end != text && *end == '\0') ? static_cast<size_t>(v) : kDefaultMergeGapBytes;
+    }();
+    return gap;
+}
 }  // namespace
 
 void ShadowBuffer::release() {
@@ -50,7 +79,8 @@ size_t ShadowBuffer::upload(WGPUDevice device, WGPUQueue queue, WGPUBufferUsage 
         ++ranges;
         return bytes;
     }
-    // Element-wise diff against the shadow; runs closer than kMergeGapBytes are merged.
+    // Element-wise diff against the shadow; runs closer than the merge gap are merged.
+    const size_t gap = mergeGapBytes();
     size_t written = 0;
     const size_t common = std::min(bytes, shadow.size());
     const size_t commonElems = common / elementSize;
@@ -68,7 +98,7 @@ size_t ShadowBuffer::upload(WGPUDevice device, WGPUQueue queue, WGPUBufferUsage 
         if (std::memcmp(data + off, shadow.data() + off, elementSize) == 0) {
             continue;
         }
-        if (open && off - runEnd > kMergeGapBytes) {
+        if (open && off - runEnd > gap) {
             flush();
         }
         if (!open) {
@@ -79,7 +109,7 @@ size_t ShadowBuffer::upload(WGPUDevice device, WGPUQueue queue, WGPUBufferUsage 
     }
     const size_t tailStart = commonElems * elementSize;
     if (bytes > tailStart) {
-        if (open && tailStart - runEnd > kMergeGapBytes) {
+        if (open && tailStart - runEnd > gap) {
             flush();
         }
         if (!open) {
@@ -94,27 +124,22 @@ size_t ShadowBuffer::upload(WGPUDevice device, WGPUQueue queue, WGPUBufferUsage 
 }
 
 void Geometry::shutdown() {
-    for (Set& s : m_sets) {
-        s.vertices.release();
-        s.indices.release();
-        s.instances.release();
-    }
-    m_current = 0;
+    m_vertices.release();
+    m_indices.release();
+    m_instances.release();
     m_vertexBytes = m_indexBytes = m_instanceBytes = 0;
 }
 
 size_t Geometry::upload(WGPUDevice device, WGPUQueue queue, const gpu::GpuFrame& frame, uint32_t& ranges) {
-    m_current = (m_current + 1) % kSets;
-    Set& s = m_sets[m_current];
     m_vertexBytes = frame.vertices.size() * sizeof(gpu::Vertex);
     m_indexBytes = frame.indices.size() * sizeof(uint32_t);
     m_instanceBytes = frame.particleInstances.size() * sizeof(gpu::ParticleInstance);
     size_t written = 0;
-    written += s.vertices.upload(device, queue, WGPUBufferUsage_Vertex, frame.vertices.data(), m_vertexBytes,
+    written += m_vertices.upload(device, queue, WGPUBufferUsage_Vertex, frame.vertices.data(), m_vertexBytes,
                                  sizeof(gpu::Vertex), ranges);
-    written += s.indices.upload(device, queue, WGPUBufferUsage_Index, frame.indices.data(), m_indexBytes,
+    written += m_indices.upload(device, queue, WGPUBufferUsage_Index, frame.indices.data(), m_indexBytes,
                                 sizeof(uint32_t), ranges);
-    written += s.instances.upload(device, queue, WGPUBufferUsage_Vertex, frame.particleInstances.data(),
+    written += m_instances.upload(device, queue, WGPUBufferUsage_Vertex, frame.particleInstances.data(),
                                   m_instanceBytes, sizeof(gpu::ParticleInstance), ranges);
     return written;
 }

@@ -5,8 +5,10 @@
 // sampling"), so vs_quad does not flip v and no shader here reconstructs a flipped row.
 //
 // group 0: the pass constants (surface px -> NDC: the three columns of GL's uNdc), dynamic offset;
-// group 1: the command's parameter block (gpu_frame.h's *Params structs as raw floats), dynamic
-//          offset, read with pf(index);
+// group 1: binding 0 = the command's parameter block (gpu_frame.h's *Params structs as raw floats),
+//          dynamic offset, read with pf(index); binding 1 = the command's analytic clip block
+//          (T-718: gpu_frame.h AnalyticClipParams at DrawCmd::clipParamIndex; the zero block, count
+//          0, for a command without one), dynamic offset, read by clipCoverage();
 // group 2: t0 = the command's texture or src target, t1 = aux, t2 = the GradientMask LUT,
 //          smp = the command's sampler.
 
@@ -21,6 +23,14 @@ struct ParamBlock {
     v: array<vec4f, 32>,
 }
 @group(1) @binding(0) var<uniform> uParams: ParamBlock;
+
+// gpu_frame.h AnalyticClipParams: the slot count, then per slot four vec4 -- localFromDevice
+// (a, b, c, d), (e, f, -, -), the rectangle (x, y, w, h) and its radii (tl, tr, br, bl).
+struct ClipBlock {
+    head: vec4u,
+    slots: array<vec4f, 12>,
+}
+@group(1) @binding(1) var<uniform> uClip: ClipBlock;
 
 @group(2) @binding(0) var t0: texture_2d<f32>;
 @group(2) @binding(1) var t1: texture_2d<f32>;
@@ -51,10 +61,57 @@ fn tex1(uv: vec2f) -> vec4f {
     return textureSampleLevel(t1, smp, uv, 0.0);
 }
 
+// px (T-718): the fragment's position in surface pixels (gpu_frame.h "Coordinates"), interpolated
+// linearly in screen space, so it is exact for projected (w != 1) vertices too.
 struct VsOut {
     @builtin(position) pos: vec4f,
     @location(0) uv: vec2f,
     @location(1) color: vec4f,
+    @location(2) @interpolate(linear) px: vec2f,
+}
+
+// T-718 (Docs/design/10-backends.md section 10.16 W1 item 2): the coverage of clip slot `i` at the
+// surface pixel position `px`: clamp(0.5 - d, 0, 1), d = the signed distance to the rounded
+// rectangle's boundary in device pixels -- the local signed distance over the length of its
+// gradient taken back to device space (M^T g, M = the 2x2 of localFromDevice).
+fn clipSlotCoverage(i: u32, px: vec2f) -> f32 {
+    let m = uClip.slots[i * 4u];
+    let t = uClip.slots[i * 4u + 1u];
+    let rect = uClip.slots[i * 4u + 2u];
+    let radii = uClip.slots[i * 4u + 3u];
+    let p = vec2f(m.x * px.x + m.z * px.y + t.x, m.y * px.x + m.w * px.y + t.y);
+    let half = rect.zw * 0.5;
+    let q0 = p - (rect.xy + half);
+    let right = q0.x > 0.0;
+    let r = select(select(radii.x, radii.y, right), select(radii.w, radii.z, right), q0.y > 0.0);
+    let s = vec2f(select(-1.0, 1.0, right), select(-1.0, 1.0, q0.y > 0.0));
+    let q = abs(q0) - half + vec2f(r);
+    var d: f32;
+    var g: vec2f;
+    if (q.x > 0.0 && q.y > 0.0) {
+        let l = length(q);
+        d = l - r;
+        g = q / l * s;
+    } else if (q.x > q.y) {
+        d = q.x - r;
+        g = vec2f(s.x, 0.0);
+    } else {
+        d = q.y - r;
+        g = vec2f(0.0, s.y);
+    }
+    let gd = vec2f(m.x * g.x + m.y * g.y, m.z * g.x + m.w * g.y);
+    return clamp(0.5 - d / max(length(gd), 1e-20), 0.0, 1.0);
+}
+
+// The product of the command's analytic clip coverages at `px`; exactly 1 without a clip (count 0),
+// so a leaf program's output times this is its output of before.
+fn clipCoverage(px: vec2f) -> f32 {
+    var c = 1.0;
+    let n = min(uClip.head.x, 3u);
+    for (var i = 0u; i < n; i = i + 1u) {
+        c = c * clipSlotCoverage(i, px);
+    }
+    return c;
 }
 
 // kMainVert: posW = (x*w, y*w, w), divided to NDC and re-multiplied by w (19 section 19.7).
@@ -65,6 +122,7 @@ fn vs_main(@location(0) posW: vec3f, @location(1) uv: vec2f, @location(2) color:
     o.pos = vec4f(p * posW.z, 0.0, posW.z);
     o.uv = uv;
     o.color = color;
+    o.px = posW.xy / posW.z;
     return o;
 }
 
@@ -76,6 +134,7 @@ fn vs_quad(@location(0) posW: vec3f, @location(1) uv: vec2f, @location(2) color:
     o.pos = vec4f(p * posW.z, 0.0, posW.z);
     o.uv = uv;
     o.color = vec4f(1.0);
+    o.px = posW.xy / posW.z;
     return o;
 }
 
@@ -95,6 +154,7 @@ fn vs_particle(@builtin(vertex_index) vi: u32, @location(0) centerSize: vec4f, @
     o.pos = vec4f(ndc(px), 0.0, 1.0);
     o.uv = mix(uvRect.xy, uvRect.zw, corner);
     o.color = color;
+    o.px = px;
     return o;
 }
 

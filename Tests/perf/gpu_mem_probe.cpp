@@ -9,6 +9,7 @@
 //                    [--width W] [--height H] [--msaa 1|4] [--backend <name>] [--power low|high]
 //                    [--mode hide|destroy] [--trim-each-scene 0|1] [--image-budget <MiB|default>]
 //                    [--prewarm-hidden N] [--no-system-fonts] [--hold <ui> <frames>] [--preload]
+//                    [--world-layers]
 //
 // T-683 (50 §50.ad): --prewarm-hidden N creates every surface of the sequence first, hidden, and runs N
 // frames (each updating every surface) before the first one is shown -- the host flow, where every surface
@@ -27,8 +28,12 @@
 // the target is created (and its image budget set), printing "preload <ui> <n> loaded <ms> ms" for each; and
 // for every scene of round 1 a line "first_show <ui> <ms> ms new_images <n>" follows its first frame (n = the
 // image textures that frame uploaded, from the library's shared-cache line), with or without --preload.
-// Exit codes: 0 ok, 2 bad arguments, 1 a C ABI failure; "SKIP: no WebGPU adapter" (exit 0) when no
-// target can be created for want of an adapter.
+// T-709 (50 §50.af): --world-layers draws every UI in world-layer output -- xt_surface_render_layers_gpu,
+// then xt_surface_draw_layers_gpu through xtframe-view's layers camera (xt_world_layer_orbit_matrix: yaw -30,
+// pitch 14, the view's field of view, depth scale 1) -- instead of xt_surface_render_gpu, and after each
+// scene prints "layers <ui> <count> surface_bytes <n>" followed by one "layer <ui> <index> id <id> <w>x<h>
+// <bytes>" per layer. Exit codes: 0 ok, 2 bad arguments, 1 a C ABI failure; "SKIP: no WebGPU adapter" (exit
+// 0) when no target can be created for want of an adapter.
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -70,8 +75,13 @@ struct Options {
     bool systemFonts = true;      ///< T-683: false = --no-system-fonts
     std::string holdUi;           ///< T-685: --hold <ui> <frames> (empty = no hold)
     int holdFrames = 0;
-    bool preload = false;  ///< T-688: --preload
+    bool preload = false;      ///< T-688: --preload
+    bool worldLayers = false;  ///< T-709: --world-layers
 };
+
+/// T-709: --world-layers, and the camera matrix of the layers view at the target's size.
+bool g_worldLayers = false;
+float g_layerMatrix[16] = {};
 
 bool parseInt(const std::string& text, int lo, int hi, int& out) {
     int v = 0;
@@ -90,6 +100,10 @@ bool parseArgs(int argc, char** argv, Options& o) {
         const std::string key = argv[i];
         if (key == "--no-system-fonts") {  // T-683: an option without a value
             o.systemFonts = false;
+            continue;
+        }
+        if (key == "--world-layers") {  // T-709: an option without a value
+            o.worldLayers = true;
             continue;
         }
         if (key == "--preload") {  // T-688: an option without a value
@@ -369,7 +383,13 @@ double frame(xt_gpu_target* t, std::vector<xt_surface*>& surfaces, double* begin
     for (xt_surface* s : surfaces) {
         if (s != nullptr) {
             xt_surface_update(s, 1.0f / 60.0f);
-            xt_surface_render_gpu(s, t, nullptr);
+            if (g_worldLayers) {  // T-709
+                if (xt_surface_render_layers_gpu(s, t) == XT_STATUS_OK) {
+                    xt_surface_draw_layers_gpu(s, t, nullptr, g_layerMatrix, 1.0f);
+                }
+            } else {
+                xt_surface_render_gpu(s, t, nullptr);
+            }
         }
     }
     xt_gpu_target_end_frame(t);
@@ -455,6 +475,11 @@ int run(const Options& o) {
         xt_gpu_target_set_image_budget(t, static_cast<uint64_t>(o.imageBudgetMiB) << 20);
     }
     writeRow(f, 0, 0, "target_create", "", t, -1, 0, start);
+    g_worldLayers = o.worldLayers;  // T-709
+    if (g_worldLayers) {
+        const float w = static_cast<float>(o.width), h = static_cast<float>(o.height);
+        xt_world_layer_orbit_matrix(g_layerMatrix, w, h, w, h, -30.0f, 14.0f, 0.0f);
+    }
     if (o.preload) {  // T-688: every UI of the sequence, before any surface exists
         for (const std::string& id : ids) {
             uint32_t loaded = 0;
@@ -482,6 +507,9 @@ int run(const Options& o) {
         xt_surface* s = xt_surface_create(b, ids[k].c_str(), &d);
         if (s == nullptr) {
             std::fprintf(stderr, "xt_surface_create(%s): %s\n", ids[k].c_str(), xt_capi_last_error());
+        } else if (o.worldLayers && xt_surface_set_world_layers(s, 1) != XT_STATUS_OK) {  // T-709
+            std::fprintf(stderr, "xt_surface_set_world_layers(%s): %s\n", ids[k].c_str(),
+                         xt_capi_last_error());
         }
         return s;
     };
@@ -546,6 +574,23 @@ int run(const Options& o) {
             }
             const double steadyMs = o.framesPerScene > 1 ? rest / (o.framesPerScene - 1) : firstMs;
             writeRow(f, round, sceneIndex, "scene", ids[k], t, firstMs, steadyMs, start);
+            if (o.worldLayers) {  // T-709: the layers of the scene and the surface memory they make up
+                xt_gpu_memory_stats ms{};
+                ms.struct_size = sizeof ms;
+                xt_gpu_target_memory_stats(t, &ms);
+                const uint32_t count = xt_surface_world_layer_count(surfaces[k]);
+                std::printf("layers %s %u surface_bytes %llu\n", ids[k].c_str(), count,
+                            static_cast<unsigned long long>(ms.surface_bytes));
+                for (uint32_t i = 0; i < count; ++i) {
+                    xt_world_layer l{};
+                    l.struct_size = sizeof l;
+                    if (xt_surface_world_layer_info(surfaces[k], i, &l) != XT_STATUS_OK) continue;
+                    std::printf("layer %s %u id %u %ux%u %llu\n", ids[k].c_str(), i, l.id, l.tex_width,
+                                l.tex_height,
+                                static_cast<unsigned long long>(l.tex_width) * l.tex_height * 4ull);
+                }
+                std::fflush(stdout);
+            }
             if (!o.holdUi.empty() && ids[k] == o.holdUi) {
                 hold(o, t, surfaces);
                 writeRow(f, round, sceneIndex, "hold", ids[k], t, -1, 0, start);

@@ -52,6 +52,7 @@ const char* const kShaderFiles[kShaderCount] = {
     shaders::k_fx_downsample,
     shaders::k_fx_kawase,
     shaders::k_fx_level_mix,
+    shaders::k_fx_backdrop_masked,  // T-729
 };
 
 /// T-456: the shader of the init probe -- a full-screen triangle and a constant colour, no bindings.
@@ -293,6 +294,8 @@ ShaderId effectShader(gpu::EffectProgram program) {
             return kShFxKawase;
         case EffectProgram::LevelMix:
             return kShFxLevelMix;
+        case EffectProgram::BackdropMasked:  // T-729
+            return kShFxBackdropMasked;
         case EffectProgram::None:
         case EffectProgram::Custom:
         default:
@@ -315,8 +318,10 @@ bool Pipelines::init(WGPUDevice device, std::string& err) {
     const WGPUShaderStage vf = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;
     const WGPUBindGroupLayoutEntry pass = uniformEntry(0, vf, 48);
     m_bglPass = makeLayout(device, &pass, 1, "xt_wgpu pass constants");
-    const WGPUBindGroupLayoutEntry params = uniformEntry(0, vf, kParamBlockBytes);
-    m_bglParams = makeLayout(device, &params, 1, "xt_wgpu command parameters");
+    // T-718: binding 1 = the command's analytic clip block (prelude.wgsl uClip), its own offset.
+    const WGPUBindGroupLayoutEntry params[2] = {uniformEntry(0, vf, kParamBlockBytes),
+                                                uniformEntry(1, WGPUShaderStage_Fragment, kClipBlockBytes)};
+    m_bglParams = makeLayout(device, params, 2, "xt_wgpu command parameters");
     WGPUBindGroupLayoutEntry tex[4] = {
         textureEntry(0, WGPUTextureSampleType_Float), textureEntry(1, WGPUTextureSampleType_Float),
         textureEntry(2, WGPUTextureSampleType_Float), WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT};

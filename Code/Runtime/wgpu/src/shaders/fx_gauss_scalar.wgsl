@@ -1,9 +1,16 @@
 // EffectProgram::GaussScalar (gpu_frame.h GaussParams: texel 0-1, dir 2-3, tapCount 4, constEdge 5,
-// outside 6, weights 7-39, offsets 40-72). Mirrors gl_shaders.h kFxGaussScalarFrag; t0 = the scalar
-// field (.r).
+// outside 6, weights 7-39, offsets 40-72, channel 73). Mirrors gl_shaders.h kFxGaussScalarFrag; t0 =
+// the scalar field (.r), or (T-728) a color source read as alpha (channel 1) / 1 - alpha (channel 2).
 fn samp(uv: vec2f) -> f32 {
     if (pi(5u) == 1 && !insideUnit(uv)) {
         return pf(6u);
+    }
+    let channel = pi(73u);
+    if (channel == 1) {
+        return tex0(uv).a;
+    }
+    if (channel == 2) {
+        return 1.0 - tex0(uv).a;
     }
     return tex0(uv).r;
 }

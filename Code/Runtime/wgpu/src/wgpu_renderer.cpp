@@ -7,6 +7,7 @@
 #include <cstring>
 #include <string>
 
+#include "wgpu_timing.h"
 #include "wgpu_util.h"
 #include "xt/gpu/frame_builder.h"
 #include "xt/gpu/gpu_frame.h"
@@ -57,6 +58,9 @@ struct WgpuRenderer::Impl {
     int width = 0, height = 0;
     float buildMs = 0, submitMs = 0;
     WgpuFramesInFlight framesInFlight;  ///< T-674
+    detail::GpuTimer timer;             ///< T-734: off unless setGpuTiming(true)
+    uint64_t frameCounter = 0;          ///< T-734: render() / submit() calls since init
+    uint64_t currentFrame = 0;          ///< T-734: the number of the frame being drawn
     std::string adapterName;
     std::string lastError;
     std::string lastWarning;
@@ -87,6 +91,7 @@ struct WgpuRenderer::Impl {
             return false;
         }
         builder.init(device);
+        frameCounter = 0;                            // T-734
         builder.setEdgeFringe(in.sampleCount <= 1);  // a multisampled target resolves edges itself
         initialized = true;
         if (width > 0 && height > 0) {
@@ -99,6 +104,8 @@ struct WgpuRenderer::Impl {
         if (!initialized) {
             return;
         }
+        device.setGpuTimer(nullptr);  // T-734
+        timer.disable();
         builder.shutdown();
         device.shutdown();
         framesInFlight.reset();  // T-674
@@ -123,6 +130,7 @@ struct WgpuRenderer::Impl {
                 const IrView* ir, PerfTracker* perf, const DamageList* damage) {
         FrameStats* stats = (perf != nullptr && perf->enabled()) ? &perf->current() : nullptr;
         PerfFieldScope renderScope(stats != nullptr ? &stats->renderMs : nullptr);
+        currentFrame = frameCounter++;  // T-734
         if (initialized && target == nullptr) {
             lastError = "WgpuRenderer::render: no target view";
             buildMs = submitMs = 0;
@@ -166,7 +174,10 @@ struct WgpuRenderer::Impl {
         }
         device.setSurface(target);
         const auto s0 = std::chrono::steady_clock::now();
+        const bool timed = timer.enabled();  // T-734: off = the submit of before
+        if (timed) timer.beginFrame(currentFrame, frame.passes.size());
         device.submit(frame);
+        if (timed) timer.endFrame();
         submitMs = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - s0).count();
         if (device.lastSubmissionIndex() != 0)
             framesInFlight.noteSubmit(device.lastSubmissionIndex());  // T-674
@@ -322,6 +333,7 @@ uint32_t WgpuRenderer::build(const CommandList& list, TextShaper* shaper, AssetR
 void WgpuRenderer::submit(WGPUTextureView target, PerfTracker* perf) {
     FrameStats* stats = (perf != nullptr && perf->enabled()) ? &perf->current() : nullptr;
     PerfFieldScope renderScope(stats != nullptr ? &stats->renderMs : nullptr);
+    m_impl->currentFrame = m_impl->frameCounter++;  // T-734
     m_impl->submitFrame(target, stats);
 }
 
@@ -356,6 +368,8 @@ WgpuStats WgpuRenderer::stats() const {
     s.blits = d.blits;
     s.cacheStores = d.cacheStores;
     s.coverageAtlasBytes = m_impl->builder.lastCoverageStats().atlasBytes;
+    s.effectCacheBytes = m_impl->builder.lastBuildStats().effectCacheBytes;  // T-730
+    s.effectCacheEntries = m_impl->builder.lastBuildStats().effectCacheEntries;
     s.inflightWaits = m_impl->framesInFlight.frameWaits();  // T-674
     s.inflightWaitMs = m_impl->framesInFlight.frameWaitMs();
     const WgpuPipelineCounters pc = m_impl->device.pipelineCounters();  // T-683
@@ -380,6 +394,14 @@ WgpuStats WgpuRenderer::stats() const {
         s.clipScissor = clip.scissor;
         s.clipImageDirect = clip.imageDirect;
         s.clipMaskLayers = clip.maskLayers;
+        const gpu::FrameBuilder::BuildStats build = m_impl->builder.lastBuildStats();  // T-718
+        s.analyticClips = build.analyticClips;
+        s.analyticClipFallbacks = build.analyticClipFallbacks;
+        s.effectCachePhaseHits = build.effectCachePhaseHits;  // T-721
+        s.effectCacheSettles = build.effectCacheSettles;
+        s.backdropPairHits = build.backdropPairHits;  // T-730
+        s.backdropPairMisses = build.backdropPairMisses;
+        s.backdropPairStores = build.backdropPairStores;
     }
     s.uploadBytes = d.uploadBytes;
     s.planMs = d.planMs;
@@ -409,5 +431,24 @@ void WgpuRenderer::setGlyphAtlas(xt::text::GlyphAtlas* atlas) { m_impl->builder.
 
 WgpuDevice* WgpuRenderer::device() { return m_impl->initialized ? &m_impl->device : nullptr; }
 WgpuFramesInFlight& WgpuRenderer::framesInFlight() { return m_impl->framesInFlight; }
+
+bool WgpuRenderer::setGpuTiming(bool on) {
+    Impl& m = *m_impl;
+    if (!on) {
+        m.device.setGpuTimer(nullptr);
+        m.timer.disable();
+        return true;
+    }
+    if (!m.initialized || !m.timer.enable(m.device.device(), m.device.queue())) {
+        return false;
+    }
+    m.device.setGpuTimer(&m.timer);
+    return true;
+}
+
+bool WgpuRenderer::gpuTimingEnabled() const { return m_impl->timer.enabled(); }
+size_t WgpuRenderer::takeGpuTimings(std::vector<WgpuGpuTiming>& out) { return m_impl->timer.take(out); }
+uint64_t WgpuRenderer::gpuTimingDropped() const { return m_impl->timer.dropped(); }
+bool WgpuRenderer::gpuTimingHasQuerySet() const { return m_impl->timer.hasQuerySet(); }
 
 }  // namespace xt::wgpu

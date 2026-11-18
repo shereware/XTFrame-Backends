@@ -73,6 +73,8 @@ bool GlDevice::linkMain(Program& p, const char* frag, std::string& err) {
     p.uShape2 = glGetUniformLocation(p.id, "uShape2");
     p.uRadii2 = glGetUniformLocation(p.id, "uRadii2");
     p.uTerms = glGetUniformLocation(p.id, "uTerms");
+    p.uClipCount = glGetUniformLocation(p.id, "uClipCount");  // T-719 (the leaf programs).
+    p.uClip = glGetUniformLocation(p.id, "uClip");
     // Sampler units and the LUT width never change (T-159): set once. A -1 location is a no-op.
     glUseProgram(p.id);
     glUniform1i(glGetUniformLocation(p.id, "uTex"), 0);
@@ -91,6 +93,8 @@ bool GlDevice::linkParticle(ParticleProgram& p, const char* frag, std::string& e
     p.uNdc = glGetUniformLocation(p.id, "uNdc");
     p.uXf = glGetUniformLocation(p.id, "uXf");
     p.uStraight = glGetUniformLocation(p.id, "uStraight");
+    p.uClipCount = glGetUniformLocation(p.id, "uClipCount");  // T-719
+    p.uClip = glGetUniformLocation(p.id, "uClip");
     glUseProgram(p.id);
     glUniform1i(glGetUniformLocation(p.id, "uTex"), 0);
     return true;
@@ -207,9 +211,7 @@ void GlDevice::drawParticles(const gpu::DrawCmd& cmd) {
     std::memcpy(static_cast<void*>(&pp), p, sizeof(pp));
     const bool textured = cmd.shading == gpu::Shading::ParticleTexture;
     ParticleProgram& prog = textured ? m_particleTexture : m_particleSolid;
-    m_cache.useProgram(prog.id);
-    prog.shadow.stats = &m_cache.stats;
-    prog.shadow.setMat3(prog.uNdc, m_ndc);
+    if (!useLeaf(prog, cmd)) return;  // T-719
     const float xf[9] = {pp.xf[0], pp.xf[1], 0.0f, pp.xf[2], pp.xf[3], 0.0f, pp.xf[4], pp.xf[5], 1.0f};
     prog.shadow.setMat3(prog.uXf, xf);
     if (textured) {
@@ -1103,9 +1105,7 @@ void GlDevice::drawCoverage(const gpu::DrawCmd& cmd) {
     // T-660b: the coverage page on unit 1 (our own R8 texture: linear and clamped since creation).
     if (cmd.shading == gpu::Shading::Solid) {
         Program& prog = m_coverageSolid;
-        m_cache.useProgram(prog.id);
-        prog.shadow.stats = &m_cache.stats;
-        prog.shadow.setMat3(prog.uNdc, m_ndc);
+        if (!useLeaf(prog, cmd)) return;  // T-719
         m_cache.bindTexture(1, static_cast<GLuint>(cmd.coverage));
         m_geometry.drawRange(cmd.firstIndex, cmd.indexCount, cmd.baseVertex, m_cache.stats);
         return;
@@ -1119,9 +1119,7 @@ void GlDevice::drawCoverage(const gpu::DrawCmd& cmd) {
     std::memcpy(&cp, p, sizeof(cp));
     const gpu::GradientParams& gp = cp.gradient;
     Program& prog = m_coverageGradient;
-    m_cache.useProgram(prog.id);
-    prog.shadow.stats = &m_cache.stats;
-    prog.shadow.setMat3(prog.uNdc, m_ndc);
+    if (!useLeaf(prog, cmd)) return;  // T-719
     bindSampled(cmd.texture, gpu::Sampler::LinearClamp);
     m_cache.bindTexture(1, static_cast<GLuint>(cmd.coverage));
     prog.shadow.set1i(prog.uKind, static_cast<int>(gp.kind));
@@ -1139,10 +1137,14 @@ void GlDevice::drawCmd(const gpu::DrawCmd& cmd) {
     using gpu::Shading;
     // Inputs first: resolving a multisampled input changes the draw framebuffer, viewport and
     // draw state, and the per-command state below puts everything back only when it differs.
-    GLuint srcTex = 0, auxTex = 0;
+    GLuint srcTex = 0, auxTex = 0, unit2Tex = static_cast<GLuint>(cmd.texture);
     if (cmd.shading == Shading::Composite || cmd.shading == Shading::Effect) {
         srcTex = textureOf(cmd.src);
         auxTex = cmd.aux != 0 ? textureOf(cmd.aux) : 0;
+        if (cmd.program == gpu::EffectProgram::BackdropMasked) {  // T-729: the content (S) on unit 2
+            const gpu::TargetHandle mask = gpu::backdropMaskTarget(*m_frame, cmd);
+            unit2Tex = mask != 0 ? textureOf(mask) : 0;
+        }
         m_cache.bindDrawFramebuffer(m_currentFbo);
         m_cache.viewport(m_passViewport[0], m_passViewport[1], m_passViewport[2], m_passViewport[3]);
     }
@@ -1167,9 +1169,7 @@ void GlDevice::drawCmd(const gpu::DrawCmd& cmd) {
     switch (cmd.shading) {
         case Shading::Solid:
         case Shading::StencilOnly:
-            m_cache.useProgram(m_solid.id);
-            m_solid.shadow.stats = &m_cache.stats;
-            m_solid.shadow.setMat3(m_solid.uNdc, m_ndc);
+            if (!useLeaf(m_solid, cmd)) return;  // T-719: the clip block (none for StencilOnly)
             m_geometry.drawRange(cmd.firstIndex, cmd.indexCount, cmd.baseVertex, m_cache.stats);
             return;
         case Shading::Gradient: {
@@ -1181,9 +1181,7 @@ void GlDevice::drawCmd(const gpu::DrawCmd& cmd) {
             }
             std::memcpy(&gp, p, sizeof(gp));
             Program& prog = m_gradient;
-            m_cache.useProgram(prog.id);
-            prog.shadow.stats = &m_cache.stats;
-            prog.shadow.setMat3(prog.uNdc, m_ndc);
+            if (!useLeaf(prog, cmd)) return;  // T-719
             bindSampled(cmd.texture, gpu::Sampler::LinearClamp);
             prog.shadow.set1i(prog.uKind, static_cast<int>(gp.kind));
             prog.shadow.set2f(prog.uP0, gp.p0x, gp.p0y);
@@ -1204,9 +1202,7 @@ void GlDevice::drawCmd(const gpu::DrawCmd& cmd) {
                     std::memcpy(static_cast<void*>(&lp), p, sizeof(lp));
                 }
                 Program& prog = m_textureLod;
-                m_cache.useProgram(prog.id);
-                prog.shadow.stats = &m_cache.stats;
-                prog.shadow.setMat3(prog.uNdc, m_ndc);
+                if (!useLeaf(prog, cmd)) return;  // T-719
                 prog.shadow.set4f(prog.uLodParams, lp.lod, lp.maxLevel, lp.straight, 0.0f);
                 bindSampledMip(cmd.texture);
                 m_geometry.drawRange(cmd.firstIndex, cmd.indexCount, cmd.baseVertex, m_cache.stats);
@@ -1215,9 +1211,7 @@ void GlDevice::drawCmd(const gpu::DrawCmd& cmd) {
             // T-150: a host texture (TextureStraight, or Texture bound premultiplied) is a GL
             // texture name this device did not create; sampling it needs nothing more.
             Program& prog = cmd.shading == Shading::Texture ? m_texture : m_textureStraight;
-            m_cache.useProgram(prog.id);
-            prog.shadow.stats = &m_cache.stats;
-            prog.shadow.setMat3(prog.uNdc, m_ndc);
+            if (!useLeaf(prog, cmd)) return;  // T-719
             bindSampled(cmd.texture, cmd.sampler);
             m_geometry.drawRange(cmd.firstIndex, cmd.indexCount, cmd.baseVertex, m_cache.stats);
             return;
@@ -1230,9 +1224,7 @@ void GlDevice::drawCmd(const gpu::DrawCmd& cmd) {
                 std::memcpy(static_cast<void*>(&gp), p, sizeof(gp));
             }
             Program& prog = m_glyph;
-            m_cache.useProgram(prog.id);
-            prog.shadow.stats = &m_cache.stats;
-            prog.shadow.setMat3(prog.uNdc, m_ndc);
+            if (!useLeaf(prog, cmd)) return;  // T-719
             bindSampled(cmd.texture, gpu::Sampler::LinearClamp);
             prog.shadow.set1f(prog.uGamma, gp.gamma);
             // T-178: text effect (0 = plain coverage).
@@ -1275,7 +1267,7 @@ void GlDevice::drawCmd(const gpu::DrawCmd& cmd) {
                 m_geometry.drawRange(cmd.firstIndex, cmd.indexCount, cmd.baseVertex, m_cache.stats);
                 return;
             }
-            if (!m_effects.bind(cmd.program, p, avail, srcTex, auxTex, cmd.texture, m_ndc, m_cache)) {
+            if (!m_effects.bind(cmd.program, p, avail, srcTex, auxTex, unit2Tex, m_ndc, m_cache)) {
                 m_lastError = "unsupported effect program";
                 return;
             }
@@ -1296,9 +1288,7 @@ void GlDevice::drawCmd(const gpu::DrawCmd& cmd) {
             std::memcpy(&bp, p, sizeof(bp));
             // T-683 (50 §50.ad item 1): the one-shape program unless the builder chose the multi one.
             Program& prog = cmd.boxShadowMulti != 0 ? m_boxShadowMulti : m_boxShadow;
-            m_cache.useProgram(prog.id);
-            prog.shadow.stats = &m_cache.stats;
-            prog.shadow.setMat3(prog.uNdc, m_ndc);
+            if (!useLeaf(prog, cmd)) return;  // T-719
             prog.shadow.set4f(prog.uShape, bp.x0, bp.y0, bp.x1, bp.y1);
             prog.shadow.set4f(prog.uRadii, bp.r[0], bp.r[1], bp.r[2], bp.r[3]);
             prog.shadow.set1f(prog.uSigma, bp.sigma);

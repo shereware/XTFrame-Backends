@@ -2,5 +2,5 @@
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4f {
     let s = tex0(in.uv);
-    return vec4f(s.rgb * s.a, s.a) * in.color;
+    return vec4f(s.rgb * s.a, s.a) * in.color * clipCoverage(in.px);  // T-718: 1 without an analytic clip
 }

@@ -105,3 +105,35 @@ if(TARGET xtframe-view)
                              FIXTURES_REQUIRED xt_view_renderer_shots)
     endforeach()
 endif()
+
+# T-713: xtframe-gpu-probe smoke tests over two bundles packed at test time (the cache in the build tree,
+# not next to the sources): hud-overlay (a frame that reads the surface back -- `--wgpu` crashed on its
+# first frame with "BindGroup with '' label is invalid" before T-713) and the C ABI's flip fixture (a
+# flow toggles #card on #card.Click: with --flow the click rebuilds frames, without it nothing changes).
+if(TARGET xtframe-gpu-probe AND TARGET xtframe-pack)
+    set(_probe_dir "${CMAKE_BINARY_DIR}/gpu-probe-smoke")
+    add_test(NAME xtframe-gpu-probe_pack_bundles
+             COMMAND ${CMAKE_COMMAND}
+                     -DPACK=$<TARGET_FILE:xtframe-pack> -DOUT=${_probe_dir}
+                     -DHUD=${PROJECT_SOURCE_DIR}/Examples/demos/hud-overlay
+                     -DFLIP=${PROJECT_SOURCE_DIR}/Tests/capi/fixtures/flip
+                     -P "${CMAKE_CURRENT_SOURCE_DIR}/gpu_probe_pack.cmake")
+    set_tests_properties(xtframe-gpu-probe_pack_bundles PROPERTIES FIXTURES_SETUP xt_gpu_probe_bundles)
+    set(_probe $<TARGET_FILE:xtframe-gpu-probe>)
+    set(_probe_tests xtframe-gpu-probe_event_no_flow xtframe-gpu-probe_flow_event xtframe-gpu-probe_bad_event)
+    xt_add_expect_exit_test(xtframe-gpu-probe_event_no_flow CODE 0 OUTPUT "frames reused 25/25"
+        COMMAND ${_probe} "${_probe_dir}/flip" flip 256 256 30 --event "10 #card.Click")
+    xt_add_expect_exit_test(xtframe-gpu-probe_flow_event CODE 0
+        OUTPUT "flow ui/flip\\.xtflow: loaded.*steady state" REJECT "frames reused 25/25"
+        COMMAND ${_probe} "${_probe_dir}/flip" flip 256 256 30 --flow --event "10 #card.Click")
+    xt_add_expect_exit_test(xtframe-gpu-probe_bad_event CODE 2 OUTPUT "cannot parse --event 'x #card.Click'"
+        COMMAND ${_probe} "${_probe_dir}/flip" flip --event "x #card.Click")
+    if(TARGET xt_wgpu)
+        list(APPEND _probe_tests xtframe-gpu-probe_wgpu)
+        xt_add_expect_exit_test(xtframe-gpu-probe_wgpu CODE 0
+            OUTPUT "steady state \\(8 frame\\(s\\), per frame\\):.*render [0-9.]+ ms \\| render \\+ queue wait [0-9.]+ ms.*steady-state tails.*device memory after the last frame: pooled targets [0-9]+"
+            COMMAND ${_probe} "${_probe_dir}/hud" hud 640 360 12 --wgpu --warmup 4)
+        set_tests_properties(xtframe-gpu-probe_wgpu PROPERTIES SKIP_REGULAR_EXPRESSION "no WebGPU adapter")
+    endif()
+    set_tests_properties(${_probe_tests} PROPERTIES FIXTURES_REQUIRED xt_gpu_probe_bundles TIMEOUT 300)
+endif()

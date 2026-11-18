@@ -20,5 +20,5 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     if (t > 0.0) {
         s = mix(s, levelSample(in.uv, hi), t);
     }
-    return s * in.color;
+    return s * in.color * clipCoverage(in.px);  // T-718: 1 without an analytic clip
 }

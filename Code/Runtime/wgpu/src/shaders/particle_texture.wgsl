@@ -6,5 +6,5 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     if (pf(6u) != 0.0) {
         s = vec4f(s.rgb * s.a, s.a);
     }
-    return s * in.color;
+    return s * in.color * clipCoverage(in.px);  // T-718: 1 without an analytic clip
 }

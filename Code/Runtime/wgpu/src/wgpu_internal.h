@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <string>
 #include <string_view>
@@ -94,6 +95,7 @@ enum ShaderId : uint16_t {
     kShFxDownsample,
     kShFxKawase,
     kShFxLevelMix,
+    kShFxBackdropMasked,  ///< T-729: EffectProgram::BackdropMasked
     kShaderCount
 };
 
@@ -225,7 +227,8 @@ private:
 };
 
 /// One of the frame's GPU buffers with a CPU shadow: `upload` writes only the byte ranges that
-/// differ from what this buffer last held (T-159), growing it in 64 KB steps.
+/// differ from what this buffer last held (T-159), growing it in 64 KB steps. T-726: changed runs closer
+/// than 1 KB (XT_WGPU_UPLOAD_MERGE_GAP) are written as one.
 struct ShadowBuffer {
     WGPUBuffer buffer = nullptr;
     uint64_t capacity = 0;
@@ -240,50 +243,57 @@ struct ShadowBuffer {
     void release();
 };
 
-/// The frame's vertex, index and particle-instance buffers: three rotating sets (§10.10.2 first
-/// row, the T-159 strategy), each uploaded against its own shadow.
+/// The frame's vertex, index and particle-instance buffers, each uploaded against its shadow (the T-159
+/// strategy). T-726: one set, written against what the previous frame left in it -- queue writes are
+/// ordered with the submissions, so a frame in flight never sees the next frame's writes
+/// (wgpu_geometry.cpp).
 class Geometry {
 public:
     void shutdown();
-    /// Uploads the frame into the next set. Returns the bytes written; `ranges` counts the writes.
+    /// Uploads the frame. Returns the bytes written; `ranges` counts the writes.
     size_t upload(WGPUDevice device, WGPUQueue queue, const gpu::GpuFrame& frame, uint32_t& ranges);
-    WGPUBuffer vertices() const { return m_sets[m_current].vertices.buffer; }
-    WGPUBuffer indices() const { return m_sets[m_current].indices.buffer; }
-    WGPUBuffer instances() const { return m_sets[m_current].instances.buffer; }
+    WGPUBuffer vertices() const { return m_vertices.buffer; }
+    WGPUBuffer indices() const { return m_indices.buffer; }
+    WGPUBuffer instances() const { return m_instances.buffer; }
     uint64_t vertexBytes() const { return m_vertexBytes; }
     uint64_t indexBytes() const { return m_indexBytes; }
     uint64_t instanceBytes() const { return m_instanceBytes; }
 
 private:
-    static constexpr int kSets = 3;
-    struct Set {
-        ShadowBuffer vertices, indices, instances;
-    };
-    Set m_sets[kSets];
-    int m_current = 0;
+    ShadowBuffer m_vertices, m_indices, m_instances;
     uint64_t m_vertexBytes = 0, m_indexBytes = 0, m_instanceBytes = 0;
 };
 
 /// Size of one command's parameter binding (group 1): 128 floats.
 inline constexpr uint32_t kParamBlockBytes = 512;
+/// T-718: size of one command's analytic clip binding (group 1 binding 1): gpu::AnalyticClipParams.
+inline constexpr uint32_t kClipBlockBytes = sizeof(gpu::AnalyticClipParams);
 /// Uniform dynamic offsets are multiples of this.
 inline constexpr uint32_t kUniformAlign = 256;
 
-/// A group-2 bind group's contents (one per distinct combination per submit).
+/// T-726: the id of the dummy view (never destroyed while a device binds it, so never indexed) ...
+inline constexpr uint64_t kDummyViewId = 1;
+/// ... and a new id for every other view a bind group may name (a texture table entry, a pooled
+/// transient, a shared image): process-wide and never reused, so a view made at the address of a
+/// destroyed one never matches the destroyed one's bind groups (wgpu_draw.cpp).
+uint64_t newViewId();
+
+/// A group-2 (or blit) bind group's contents. T-726: equal and hashed by the view ids, not by the
+/// view handles (a new view may reuse a destroyed one's address); the handles are what it is made of.
 struct BindGroupKey {
     WGPUBindGroupLayout layout = nullptr;
     WGPUTextureView v0 = nullptr, v1 = nullptr, v2 = nullptr;
+    uint64_t id0 = 0, id1 = 0, id2 = 0;  ///< the ids of v0..v2 (0: not cacheable)
     WGPUSampler sampler = nullptr;
     bool operator==(const BindGroupKey& o) const {
-        return layout == o.layout && v0 == o.v0 && v1 == o.v1 && v2 == o.v2 && sampler == o.sampler;
+        return layout == o.layout && id0 == o.id0 && id1 == o.id1 && id2 == o.id2 && sampler == o.sampler;
     }
 };
 struct BindGroupKeyHash {
     size_t operator()(const BindGroupKey& k) const {
-        size_t h = std::hash<const void*>()(k.layout);
-        for (const void* p : {static_cast<const void*>(k.v0), static_cast<const void*>(k.v1),
-                              static_cast<const void*>(k.v2), static_cast<const void*>(k.sampler)}) {
-            h = h * 1099511628211ull ^ std::hash<const void*>()(p);
+        size_t h = std::hash<const void*>()(k.layout) ^ std::hash<const void*>()(k.sampler) * 31u;
+        for (const uint64_t id : {k.id0, k.id1, k.id2}) {
+            h = h * 1099511628211ull ^ std::hash<uint64_t>()(id);
         }
         return h;
     }
@@ -311,7 +321,8 @@ struct WgpuSharedCache::Impl {
         uint32_t levels = 1;  ///< T-665: mip levels of `texture` (WgpuDevice::requestMipChain)
         uint32_t uses = 0;    ///< device handles naming it
         uint64_t bytes = 0;
-        bool idle = false;  ///< T-656: in `idle` (no use)
+        bool idle = false;    ///< T-656: in `idle` (no use)
+        uint64_t viewId = 0;  ///< T-726: detail::newViewId of `view` (a new one with each new view)
     };
     std::vector<Image> images;  ///< id i + 1 = images[i]
     std::vector<uint32_t> freeIds;
@@ -393,10 +404,21 @@ struct WgpuSharedCache::Impl {
     WGPUTextureView dummyView = nullptr;
     /// Target frames (WgpuSharedCache::endFrame): the clock of every pool above.
     uint32_t frame = 0;
-    /// Bumped whenever a pooled view that a device's bind groups may name (a transient, a cached
-    /// target) is destroyed; each device flushes its bind groups before its next submit when it
-    /// differs from the value it saw (WgpuDevice::m_seenViewGeneration).
+    /// Bumped whenever a view that several devices' bind groups may name (a transient, a cached
+    /// target, a shared image's replaced view) is destroyed. T-726: each such view's id goes into
+    /// `viewLog` (the last kViewLogSize of them; entry i is number viewGeneration - viewLog.size() + i),
+    /// and each device removes the bind groups naming those ids before its next submit
+    /// (WgpuDevice::syncSharedViews); a device that saw less than the log still holds flushes all.
     uint64_t viewGeneration = 0;
+    std::deque<uint64_t> viewLog;
+    static constexpr size_t kViewLogSize = 4096;
+    /// T-726: logs the destroyed view `id` (0 = none: nothing is logged).
+    void noteViewDestroyed(uint64_t id) {
+        if (id == 0) return;
+        viewLog.push_back(id);
+        if (viewLog.size() > kViewLogSize) viewLog.pop_front();
+        ++viewGeneration;
+    }
 
     /// Creates the dummy on `device` once (uploaded through `queue`). False when it cannot be made.
     bool ensureDummy(WGPUQueue queue);
@@ -446,9 +468,21 @@ struct WgpuDevice::Gpu {
     WGPUTexture dummy = nullptr;
     WGPUTextureView dummyView = nullptr;
     /// Bind groups over this device's own views (and registered external views), kept across
-    /// submits: every release of such a view flushes them all (`releaseBindGroups`), so a key never
-    /// outlives the views it names. At most kMaxBindGroups.
+    /// submits. T-726: the release of such a view removes the groups naming it (`evictView`, through
+    /// `keysByView`), so a key never outlives the views it names. At most kMaxBindGroups.
     std::unordered_map<detail::BindGroupKey, WGPUBindGroup, detail::BindGroupKeyHash> bindGroups;
+    /// T-726: view id -> the keys of `bindGroups` naming it (every id of a key but kDummyViewId).
+    std::unordered_map<uint64_t, std::vector<detail::BindGroupKey>> keysByView;
+    /// T-726: removes the cached groups naming view `id`; returns how many.
+    uint32_t evictView(uint64_t id);
+    /// T-726: removes the cached groups of `layout` (the blit groups, which bind the uniform buffer);
+    /// returns how many.
+    uint32_t evictLayout(WGPUBindGroupLayout layout);
+    /// T-726: releases cached group `it` and drops its key from `keysByView` (but from `skipId`'s list,
+    /// which the caller is consuming).
+    void eraseCached(
+        std::unordered_map<detail::BindGroupKey, WGPUBindGroup, detail::BindGroupKeyHash>::iterator it,
+        uint64_t skipId);
     /// Bind groups over the host's surface view (a blit source), released after each submit: the
     /// host may release that view and a new one may take its address.
     std::vector<WGPUBindGroup> frameBindGroups;
@@ -469,6 +503,7 @@ struct WgpuDevice::Gpu {
     WGPURenderPipeline pipeline = nullptr;
     WGPUBindGroup textures = nullptr;
     uint32_t paramOffset = 0xFFFFFFFFu;
+    uint32_t clipOffset = 0xFFFFFFFFu;  ///< T-718: group 1's second dynamic offset
     uint32_t stencilRef = 0xFFFFFFFFu;
     int vertexSource = 0;  ///< 0 none, 1 geometry, 2 particle instances
 
@@ -476,6 +511,7 @@ struct WgpuDevice::Gpu {
         pipeline = nullptr;
         textures = nullptr;
         paramOffset = 0xFFFFFFFFu;
+        clipOffset = 0xFFFFFFFFu;
         stencilRef = 0xFFFFFFFFu;
         vertexSource = 0;
     }
@@ -484,6 +520,7 @@ struct WgpuDevice::Gpu {
             wgpuBindGroupRelease(kv.second);
         }
         bindGroups.clear();
+        keysByView.clear();
         cachedBindings = 0;
         releaseFrameBindGroups();
     }

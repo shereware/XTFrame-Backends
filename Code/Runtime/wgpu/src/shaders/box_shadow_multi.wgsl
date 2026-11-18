@@ -14,5 +14,5 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
         coverage = coverage + pf(10u + t) * bsCoverage(16u + 8u * t, p, sigma);
     }
     coverage = clamp(coverage, 0.0, 1.0);
-    return vec4f(pf(12u), pf(13u), pf(14u), pf(15u)) * coverage;
+    return vec4f(pf(12u), pf(13u), pf(14u), pf(15u)) * coverage * clipCoverage(in.px);  // T-718
 }
