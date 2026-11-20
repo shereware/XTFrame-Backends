@@ -119,6 +119,8 @@ private:
         std::string glsl;
         GLuint id = 0;  ///< 0 = the compile failed.
         GLint uNdc = -1, uTime = -1, uTexelSize = -1, uLayerSize = -1;
+        /// T-818: XtInput.local / boxSize rows (-1 for a module translated before T-818).
+        GLint uLocalRowX = -1, uLocalRowY = -1;
         std::vector<GLint> paramLocs;
         std::vector<uint8_t> types;
         std::vector<uint8_t> slots;

@@ -21,10 +21,12 @@ namespace xt::wgpu::detail {
 namespace {
 
 /// Block layout (floats): [0] xtTime, [4..5] uTexelSize, [6..7] uLayerSize, then one vec4 per
-/// parameter from [8].
+/// parameter from [8]; T-818: after the 20 parameter vec4s, `lx` = (a, c, e, boxW) and `ly` = (b, d,
+/// f, boxH) of CustomEffectParams' `localXf` / `boxW/H` (XtInput.local / boxSize, 18 §18.7.x).
 constexpr uint32_t kParamBase = 8;
 constexpr uint32_t kMaxParams = 20;  // 16 float slots + 4 colors at most (customParamSlots, T-534)
-static_assert(kParamBase + 4 * kMaxParams <= kParamBlockBytes / sizeof(float), "custom block overflows");
+constexpr uint32_t kLocalBase = kParamBase + 4 * kMaxParams;
+static_assert(kLocalBase + 8 <= kParamBlockBytes / sizeof(float), "custom block overflows");
 
 std::string wrapModule(std::string_view module, const char* names, const uint8_t* types, uint32_t count) {
     std::string src =
@@ -33,7 +35,7 @@ std::string wrapModule(std::string_view module, const char* names, const uint8_t
         "layout(location = 0) out vec4 fragColor;\n"
         "layout(set = 1, binding = 0, std140) uniform XtCustomBlock { vec4 frame; vec4 sizes; vec4 p[" +
         std::to_string(kMaxParams) +
-        "]; } "
+        "]; vec4 lx; vec4 ly; } "
         "xtU;\n"
         "layout(set = 2, binding = 0) uniform texture2D xtLayerTex;\n"
         "layout(set = 2, binding = 3) uniform sampler xtLayerSmp;\n"
@@ -72,7 +74,14 @@ std::string wrapModule(std::string_view module, const char* names, const uint8_t
         "    XtInput xtIn;\n"
         "    xtIn.uv = vUV;\n"
         "    xtIn.texelSize = uTexelSize;\n"
-        "    xtIn.layerSize = uLayerSize;\n"
+        "    xtIn.layerSize = uLayerSize;\n";
+    if (customModuleHasLocal(module)) {  // T-818; a module translated before it has no such members
+        src +=
+            "    vec3 xtPx = vec3(xtIn.uv * uLayerSize, 1.0);\n"
+            "    xtIn.local = vec2(dot(xtU.lx.xyz, xtPx), dot(xtU.ly.xyz, xtPx));\n"
+            "    xtIn.boxSize = vec2(xtU.lx.w, xtU.ly.w);\n";
+    }
+    src +=
         "    vec4 c = clamp(xtMain(xtIn), 0.0, 1.0);\n"
         "    fragColor = vec4(c.rgb * c.a, c.a);\n"
         "}\n";
@@ -180,6 +189,15 @@ bool Pipelines::packCustom(const float* params, size_t available, float* out, ui
     out[5] = cp.layerH > 0 ? 1.0f / cp.layerH : 0.0f;
     out[6] = cp.layerW;
     out[7] = cp.layerH;
+    // T-818: XtInput.local / boxSize rows.
+    out[kLocalBase + 0] = cp.localXf[0];
+    out[kLocalBase + 1] = cp.localXf[2];
+    out[kLocalBase + 2] = cp.localXf[4];
+    out[kLocalBase + 3] = cp.boxW;
+    out[kLocalBase + 4] = cp.localXf[1];
+    out[kLocalBase + 5] = cp.localXf[3];
+    out[kLocalBase + 6] = cp.localXf[5];
+    out[kLocalBase + 7] = cp.boxH;
     for (size_t i = 0; i < c.types.size(); ++i) {
         float* p = out + kParamBase + 4 * i;
         const uint8_t s = c.slots[i];

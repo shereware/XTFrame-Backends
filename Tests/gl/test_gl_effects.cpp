@@ -1454,6 +1454,110 @@ TEST_CASE("gl custom: a failed shader with fallback none leaves the content as d
     CHECK(r.pass);
 }
 
+// T-818 (Docs/design/18-effects.md §18.7.x): XtInput.local follows the node's transform, XtInput.uv
+// stays in screen space, XtInput.boxSize is the border box in CSS px.
+
+namespace {
+
+const char* const kLocalXtfx =
+    "---\n"
+    "float4 xtMain(XtInput i) {\n"
+    "    return float4(i.local.x, i.local.y, i.boxSize.x / 64, 1);\n"
+    "}\n";
+
+/// A 16 x 16 node (border box (0, 0, 16, 16)) drawn through `xf`, a shader writing `local` and
+/// `boxSize`; the effect window is the transformed box's AABB.
+CommandList localList(const std::string& glsl, Mat2x3 xf) {
+    CommandList cl = makeList();
+    addShader(cl, 5, glsl, {}, {}, EffectInstance{});
+    const Rect aabb = transformBounds(xf, Rect{0, 0, 16, 16});
+    addPushEffect(cl, {customFx(5, {})}, xf, aabb, aabb);
+    cl.effectCmds.back().localBox = Rect{0, 0, 16, 16};
+    addFillRect(cl, 0, 0, 16, 16, Color{1, 1, 1, 1});
+    cl.fills.back().xf = xf;
+    addPopEffect(cl);
+    return cl;
+}
+
+/// The pixel holding local point (4.5, 12.5) of localList's node: (0.28125, 0.78125) in `local`.
+void checkLocalCorner(const std::vector<uint8_t>& pixels, int x, int y, const char* what) {
+    INFO(what);
+    const uint8_t* p = px(pixels, 64, x, y);
+    CHECK(near(p[0], 72) <= 2);   // local.x = 4.5 / 16
+    CHECK(near(p[1], 199) <= 2);  // local.y = 12.5 / 16
+    CHECK(near(p[2], 64) <= 2);   // boxSize.x / 64 = 16 / 64
+}
+
+}  // namespace
+
+TEST_CASE("gl custom: XtInput.local follows translation, scale and rotation (T-818)") {
+    const std::string glsl = glslOf(kLocalXtfx);
+    GlSession gl(64, 64);
+    // Each transform puts the local point (4.5, 12.5) on a pixel center.
+    checkLocalCorner(gl.render(localList(glsl, translation(Vec2{8, 8}))), 12, 20, "translate (8, 8)");
+    CHECK(std::string(gl.renderer.lastWarning()).empty());
+    checkLocalCorner(gl.render(localList(glsl, translation(Vec2{30, 20}))), 34, 32, "translate (30, 20)");
+    checkLocalCorner(gl.render(localList(glsl, mul(translation(Vec2{10.5f, 10.5f}), scaling(Vec2{2, 2})))),
+                     19, 35, "scale 2");
+    checkLocalCorner(gl.render(localList(glsl, mul(translation(Vec2{40, 8}), rotationDeg(90)))), 27, 12,
+                     "rotate 90");
+}
+
+TEST_CASE("gl custom: a full-screen node moved: local follows it, uv does not (T-818)") {
+    const std::string glsl = glslOf(
+        "---\n"
+        "float4 xtMain(XtInput i) {\n"
+        "    return float4(i.uv.x, i.local.x, 0, 1);\n"
+        "}\n");
+    auto listAt = [&](float dx) {
+        CommandList cl = makeList();
+        addShader(cl, 6, glsl, {}, {}, EffectInstance{});
+        const Mat2x3 xf = translation(Vec2{dx, 0});
+        addPushEffect(cl, {customFx(6, {})}, xf, Rect{0, 0, 64, 64}, Rect{0, 0, 64, 64});
+        cl.effectCmds.back().localBox = Rect{0, 0, 64, 64};
+        addFillRect(cl, 0, 0, 64, 64, Color{1, 1, 1, 1});
+        addPopEffect(cl);
+        return cl;
+    };
+    GlSession gl(64, 64);
+    const std::vector<uint8_t> a = gl.render(listAt(0));
+    const std::vector<uint8_t> b = gl.render(listAt(8));
+    CHECK(near(px(a, 64, 32, 32)[0], 130) <= 2);  // uv.x = 32.5 / 64
+    CHECK(near(px(b, 64, 32, 32)[0], 130) <= 2);  // the window did not move
+    CHECK(near(px(a, 64, 32, 32)[1], 130) <= 2);  // local.x = 32.5 / 64
+    CHECK(near(px(b, 64, 32, 32)[1], 98) <= 2);   // local.x = 24.5 / 64
+}
+
+TEST_CASE("gl custom: XtInput.boxSize is the border box in CSS px at any dpr (T-818)") {
+    const std::string glsl = glslOf(
+        "---\n"
+        "float4 xtMain(XtInput i) {\n"
+        "    return float4(i.boxSize.x / 64, i.boxSize.y / 64, i.local.x, 1);\n"
+        "}\n");
+    for (float dpr : {1.0f, 2.0f}) {
+        INFO("dpr " << dpr);
+        CommandList cl = makeList();
+        cl.devicePixelRatio = dpr;
+        addShader(cl, 7, glsl, {}, {}, EffectInstance{});
+        const Mat2x3 xf = translation(Vec2{8, 8});
+        addPushEffect(cl, {customFx(7, {})}, xf, Rect{8, 8, 16, 32}, Rect{8, 8, 16, 32});
+        cl.effectCmds.back().localBox = Rect{0, 0, 16, 32};
+        addFillRect(cl, 0, 0, 16, 32, Color{1, 1, 1, 1});
+        cl.fills.back().xf = xf;
+        addPopEffect(cl);
+        const int size = static_cast<int>(64 * dpr);
+        GlSession gl(size, size);
+        const std::vector<uint8_t> pixels = gl.render(cl);
+        // The device pixel whose center is the local point (4.25, 8.25) at dpr 2, (4.5, 8.5) at dpr 1.
+        const int x = dpr > 1.5f ? 24 : 12;
+        const int y = dpr > 1.5f ? 32 : 16;
+        const uint8_t* p = px(pixels, size, x, y);
+        CHECK(near(p[0], 64) <= 2);                    // 16 / 64
+        CHECK(near(p[1], 128) <= 2);                   // 32 / 64
+        CHECK(near(p[2], dpr > 1.5f ? 68 : 72) <= 2);  // local.x = 4.25 / 16 or 4.5 / 16
+    }
+}
+
 TEST_CASE("gl golden: gl-only UI fixtures (custom effects) match their expected images") {
     const std::string uiDir = XT_GOLDEN_UI_DIR;
     const std::vector<golden::UiFixture> fixtures = golden::loadUiManifest(uiDir + "/manifest.txt");

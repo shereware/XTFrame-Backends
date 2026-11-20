@@ -280,19 +280,34 @@ namespace {
 /// fixed interface). `xtTexCoord` maps the top-down `XtInput.uv` convention onto the bottom-up FBO
 /// texture (kQuadVert's `vUV`); the layer is premultiplied, `xtSample` (in the module)
 /// un-premultiplies it, and `main` premultiplies `xtMain`'s straight result.
+/// T-818 (18 §18.7.x): a module whose XtInput declares `local` / `boxSize` gets them from the rows
+/// `xtLocalRowX` = (a, c, e, boxW) and `xtLocalRowY` = (b, d, f, boxH) of CustomEffectParams'
+/// `localXf` / `boxW/H`, applied to the window pixel `uv * layerSize`; a module translated before
+/// T-818 is wrapped as before.
 std::string wrapCustomModule(std::string_view module) {
+    const bool hasLocal = customModuleHasLocal(module);
     std::string src =
         "#version 330 core\n"
         "in vec2 vUV;\n"
         "out vec4 fragColor;\n"
         "vec2 xtTexCoord(vec2 uv) { return vec2(uv.x, 1.0 - uv.y); }\n";
+    if (hasLocal) {
+        src += "uniform vec4 xtLocalRowX;\nuniform vec4 xtLocalRowY;\n";
+    }
     src.append(module);
     src +=
         "\nvoid main() {\n"
         "    XtInput xtIn;\n"
         "    xtIn.uv = vec2(vUV.x, 1.0 - vUV.y);\n"
         "    xtIn.texelSize = uTexelSize;\n"
-        "    xtIn.layerSize = uLayerSize;\n"
+        "    xtIn.layerSize = uLayerSize;\n";
+    if (hasLocal) {
+        src +=
+            "    vec3 xtPx = vec3(xtIn.uv * uLayerSize, 1.0);\n"
+            "    xtIn.local = vec2(dot(xtLocalRowX.xyz, xtPx), dot(xtLocalRowY.xyz, xtPx));\n"
+            "    xtIn.boxSize = vec2(xtLocalRowX.w, xtLocalRowY.w);\n";
+    }
+    src +=
         "    vec4 c = clamp(xtMain(xtIn), 0.0, 1.0);\n"
         "    fragColor = vec4(c.rgb * c.a, c.a);\n"
         "}\n";
@@ -328,6 +343,8 @@ uint32_t CustomEffectPrograms::prepare(std::string_view glsl, const char* names,
             e.uTime = glGetUniformLocation(prog, "xtTime");
             e.uTexelSize = glGetUniformLocation(prog, "uTexelSize");
             e.uLayerSize = glGetUniformLocation(prog, "uLayerSize");
+            e.uLocalRowX = glGetUniformLocation(prog, "xtLocalRowX");  // T-818; -1 before T-818
+            e.uLocalRowY = glGetUniformLocation(prog, "xtLocalRowY");
             const char* name = names;
             for (uint32_t i = 0; i < count; ++i) {
                 e.paramLocs.push_back(name != nullptr ? glGetUniformLocation(prog, name) : -1);
@@ -365,6 +382,8 @@ bool CustomEffectPrograms::bind(const float* params, size_t available, GLuint sr
     u.set1f(e.uTime, cp.time);
     u.set2f(e.uLayerSize, cp.layerW, cp.layerH);
     u.set2f(e.uTexelSize, 1.0f / cp.layerW, 1.0f / cp.layerH);
+    u.set4f(e.uLocalRowX, cp.localXf[0], cp.localXf[2], cp.localXf[4], cp.boxW);  // T-818
+    u.set4f(e.uLocalRowY, cp.localXf[1], cp.localXf[3], cp.localXf[5], cp.boxH);
     for (size_t i = 0; i < e.paramLocs.size(); ++i) {
         const uint8_t s = e.slots[i];
         switch (e.types[i]) {

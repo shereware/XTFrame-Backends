@@ -103,7 +103,7 @@
 ///                    [--bind-planar <name>=<file.png>[,yuv420|yuva420][,601|709][,limited|full]
 ///                                   [,left|center|topleft]]
 ///                    [--fit native|stretch|contain|cover|center] [--play <timeline>]
-///                    [--seek <seconds>] [--device W:H] [--safe F|T,R,B,L]
+///                    [--seek <seconds>] [--advance <seconds>] [--device W:H] [--safe F|T,R,B,L]
 ///                    [--platform desktop|console|handheld] [--input mouse|gamepad|touch]
 ///                    [--lang <tag>] [--port <name>=<value>] [--gamepad] [--players N]
 ///                    [--borderless] [--resize-border N] [--no-live-resize]
@@ -173,6 +173,17 @@
 /// --frames 1 screenshot shows exactly that time point. --seek needs --play. An unknown timeline
 /// prints one warning and the run continues. T-573 (F17): the timeline holds its last frame when it
 /// ends (PlayOptions::hold, the trigger `play()` default) instead of releasing its members.
+///
+/// --advance <seconds> (Docs/tasks/T-817.md) starts the painted frames at that time without --play:
+/// the frames before it run exactly as in a plain run -- frame k at time k/60, frame 0 with dt 0,
+/// --port / --play / --seek and the --event / --pointer of frame k before its update(), the flows
+/// ticked -- but are not rendered, damage-tracked, screenshotted or perf-marked. The first painted
+/// frame is the one at that time (its update is the last step: 1/60, or the remainder when the time
+/// is not a multiple of 1/60), and --frames N counts painted frames from there; frame numbers go on,
+/// so `--event "130 ..."` with --advance 2 is the 11th painted frame. Its picture is byte for byte
+/// that of `--frames <60 x seconds + 1>` (on:show and lifecycle.shown timelines, transitions, CSS
+/// animations, particles with their fixed seed). --headless and --renderer runs only; the windowed
+/// run ignores it with a warning.
 ///
 /// --fit (Docs/tasks/T-156.md) chooses how the windowed run places the document: `native` lays it
 /// out at the window size (the behaviour before T-156); the other modes lay it out at the design
@@ -520,6 +531,7 @@ struct Args {
     std::string stringsDir;                   // T-623: the input's strings tables (else <root>/strings).
     std::vector<std::pair<std::string, std::string>> ports;  // T-175: --port name=value.
     float seekTime = -1.0f;                                  // T-172: --seek, < 0 = none.
+    float advance = 0.0f;                                    // T-817: --advance, 0 = none.
     bool gamepad = false;                                    // T-194: --gamepad.
     uint32_t players = 0;                                    // T-194: --players, 0 = not given.
     std::string project;                                     // T-193: --project <dir>.
@@ -974,6 +986,17 @@ bool parseArgs(int argc, char** argv, Args& out) {
             out.seekTime = std::strtof(v.c_str(), &end);
             if (end == v.c_str() || *end != '\0' || out.seekTime < 0.0f) {
                 std::fprintf(stderr, "xtframe-view: --seek: expected seconds >= 0, got '%s'\n", v.c_str());
+                return false;
+            }
+        } else if (arg == "--advance") {
+            std::string v;
+            if (!needValue("--advance", v)) {
+                return false;
+            }
+            char* end = nullptr;
+            out.advance = std::strtof(v.c_str(), &end);
+            if (end == v.c_str() || *end != '\0' || !(out.advance >= 0.0f) || !std::isfinite(out.advance)) {
+                std::fprintf(stderr, "xtframe-view: --advance: expected seconds >= 0, got '%s'\n", v.c_str());
                 return false;
             }
         } else if (!arg.empty() && arg[0] == '-') {
@@ -1634,6 +1657,9 @@ void printUsage(std::FILE* out) {
         "                          DrawBoxShadow commands; for before/after comparisons)\n"
         "  --play <timeline>       play the document's root @timeline before the first frame\n"
         "  --seek <seconds>        then seek it to that time (needs --play)\n"
+        "  --advance <seconds>     run the frames before that time without painting (updates\n"
+        "                          only; --event/--pointer in them are sent), then paint\n"
+        "                          --frames from there (--headless and --renderer runs)\n"
         "  --device W:H            device aspect ratio for @media; viewport width = height x W/H\n"
         "  --safe F | T,R,B,L      safe-area insets as fractions of the viewport (0..0.5)\n"
         "  --platform KIND         desktop, console or handheld (@media (platform))\n"
@@ -1780,6 +1806,37 @@ float dtReaching(float from, float to) {
         dt = std::nextafter(dt, reached < to ? INFINITY : -INFINITY);
     }
     return dt < 0.0f ? 0.0f : dt;
+}
+
+/// T-817 (--advance): the first painted frame and its dt. A plain run's frame k shows time k/60 (frame 0
+/// has dt 0, every later one `frameDt`), so `seconds` = N frames of `frameDt` plus a remainder r: with no
+/// remainder the frames 0..N-1 run unpainted and frame N (dt `frameDt`) is the first painted one; with
+/// one, the frames 0..N run unpainted and frame N+1 takes the remainder as its dt. `seconds` 0 = none.
+struct AdvancePlan {
+    uint32_t firstFrame = 0;  ///< Frames 0..firstFrame-1 run without painting.
+    float firstDt = 0.0f;     ///< The dt of the first painted frame.
+};
+
+AdvancePlan planAdvance(float seconds, float frameDt) {
+    AdvancePlan plan;
+    if (!(seconds > 0.0f)) {
+        return plan;
+    }
+    // A float --advance (0.1 -> 0.100000001) is a whole number of frames within 1/1000 of a frame.
+    const double steps = std::min(static_cast<double>(seconds) / static_cast<double>(frameDt),
+                                  static_cast<double>(UINT32_MAX / 2u));
+    const double nearest = std::floor(steps + 0.5);
+    if (std::fabs(steps - nearest) < 1e-3) {
+        if (nearest >= 1.0) {
+            plan.firstFrame = static_cast<uint32_t>(nearest);
+            plan.firstDt = frameDt;
+        }
+        return plan;
+    }
+    const double whole = std::floor(steps);
+    plan.firstFrame = static_cast<uint32_t>(whole) + 1u;
+    plan.firstDt = static_cast<float>((steps - whole) * static_cast<double>(frameDt));
+    return plan;
 }
 
 void printPerfSummary(const xt::PerfSummary& s, float damageAreaPercent = -1.0f, int detail = 0) {
@@ -3035,8 +3092,46 @@ int main(int argc, char** argv) {
         uint32_t idleSkipped = 0;
         bool skippedSinceUpdate = false;
         float runClock = 0.0f;
-        for (uint32_t frame = 0; frame < frameCount; ++frame) {
-            float frameDt = frame == 0 ? 0.0f : dt;
+        // T-817: --advance, the frames before the first painted one -- updated as a plain run updates
+        // them (same dts, scripted input and flow ticks), never rendered.
+        const AdvancePlan advance = planAdvance(windowLoop ? 0.0f : args.advance, dt);
+        if (windowLoop && args.advance > 0.0f) {
+            std::fprintf(stderr,
+                         "xtframe-view: --advance applies to --headless and --renderer runs; ignored\n");
+        }
+        if (advance.firstFrame > 0) {
+            ctx.perf().setEnabled(false);  // Not measured: the painted frames are.
+            for (uint32_t frame = 0; frame < advance.firstFrame; ++frame) {
+                const float frameDt = frame == 0 ? 0.0f : dt;
+                portLogFrame = frame;
+                raiseTextureVersions(args, assets, frame);
+                applyScriptedInput(args, ctx, handle, frame, systemEvent);
+                ctx.update(frameDt);
+                if (frame == 0) {
+                    reportMissingFonts(ctx.document(handle), shaper);
+                }
+                if (hasFlow) {
+                    flowRuntime.tick(frameDt);
+                }
+                if (targets.project.bundle) {
+                    targets.project.bundle->tick(frameDt);
+                }
+                if (hasFlow && args.dumpEvery > 0 && (frame + 1) % args.dumpEvery == 0) {
+                    printFlowValues(flowRuntime, frame);
+                }
+                if (targets.project.bundle && targets.project.bundle->flowRuntime().isGlobal() &&
+                    args.dumpEvery > 0 && (frame + 1) % args.dumpEvery == 0) {
+                    printFlowValues(targets.project.bundle->flowRuntime(), frame, "global flow");
+                }
+            }
+            ctx.perf().setEnabled(args.perf);
+            runClock = ctx.clock();
+        }
+        const uint32_t firstFrame = advance.firstFrame;
+        const uint32_t endFrame =
+            frameCount > UINT32_MAX - firstFrame ? UINT32_MAX : firstFrame + frameCount;  // frame < endFrame
+        for (uint32_t frame = firstFrame; frame < endFrame; ++frame) {
+            float frameDt = frame == firstFrame ? advance.firstDt : dt;
             if (windowLoop) {
                 if (!frameTarget->pump(ctx)) {
                     frameCount = frame;
@@ -3058,8 +3153,9 @@ int main(int argc, char** argv) {
                 // T-749: this frame's scripted input first -- it wakes the Context.
                 applyScriptedInput(args, ctx, handle, frame, systemEvent);
                 runClock += frameDt;
-                const bool lastShot = windowLoop && !args.screenshot.empty() && frame + 1 == frameCount;
-                if (frame > 0 && !lastShot && !ctx.needsFrame() && !(hasFlow && flowRuntime.needsTick())) {
+                const bool lastShot = windowLoop && !args.screenshot.empty() && frame + 1 == endFrame;
+                if (frame > firstFrame && !lastShot && !ctx.needsFrame() &&
+                    !(hasFlow && flowRuntime.needsTick())) {
                     ++idleSkipped;
                     skippedSinceUpdate = true;
                     continue;
@@ -3107,8 +3203,8 @@ int main(int argc, char** argv) {
                 frameTarget->frameSize(frameW, frameH);
                 frameTarget->drawLayers(
                     layerOrbit.boxToSurface(list.viewport.w, list.viewport.h, frameW, frameH));
-                const bool keepForShot = windowLoop && !args.screenshot.empty() && frame + 1 == frameCount;
-                if (!keepForShot && !(frame + 1 == frameCount && !args.layersDir.empty())) {
+                const bool keepForShot = windowLoop && !args.screenshot.empty() && frame + 1 == endFrame;
+                if (!keepForShot && !(frame + 1 == endFrame && !args.layersDir.empty())) {
                     frameTarget->present();
                 }
             } else if (frameTarget) {
@@ -3119,7 +3215,7 @@ int main(int argc, char** argv) {
                 if (args.perf && frameTarget->gpuCounters(counters)) {
                     gpuTotals.add(counters);
                 }
-                const bool keepForShot = windowLoop && !args.screenshot.empty() && frame + 1 == frameCount;
+                const bool keepForShot = windowLoop && !args.screenshot.empty() && frame + 1 == endFrame;
                 if (!keepForShot) {
                     frameTarget->present();
                 }
@@ -3133,7 +3229,7 @@ int main(int argc, char** argv) {
                 // T-753 (57 §57.2 item 2): the clear is part of the frame's `build` phase. The full
                 // repaint below blends every command over the buffer, so the whole buffer must be
                 // cleared each frame; only --partial (which also draws only the damage) clears less.
-                const bool partialFrame = partialRedraw && frame != 0 && !damage.full;
+                const bool partialFrame = partialRedraw && frame != firstFrame && !damage.full;
                 {
                     xt::PerfPhaseScope clearScope(ctx.perf(), &xt::FrameStats::renderMs,
                                                   &xt::FrameStats::buildCpuMs);
@@ -3256,11 +3352,12 @@ int main(int argc, char** argv) {
             std::printf("text=%s\n", text.c_str());
         }
         if (hasFlow && args.dumpFlowValues) {
-            printFlowValues(flowRuntime, frameCount - 1);
+            printFlowValues(flowRuntime, firstFrame + frameCount - 1);
         }
         if (targets.project.bundle && targets.project.bundle->flowRuntime().isGlobal() &&
             args.dumpFlowValues) {
-            printFlowValues(targets.project.bundle->flowRuntime(), frameCount - 1, "global flow");
+            printFlowValues(targets.project.bundle->flowRuntime(), firstFrame + frameCount - 1,
+                            "global flow");
         }
         if (args.dumpCommands) {
             // T-202: the frame the renderer drew last, one line per command (DrawParticles lists
@@ -3424,6 +3521,9 @@ int main(int argc, char** argv) {
     if (args.idleSkip) {
         std::fprintf(stderr,
                      "xtframe-view: --idle-skip applies to --headless and --renderer runs; ignored\n");
+    }
+    if (args.advance > 0.0f) {
+        std::fprintf(stderr, "xtframe-view: --advance applies to --headless and --renderer runs; ignored\n");
     }
     // T-244: --stats also reports the rig workload, which comes from the perf tracer.
     app.context().perf().setEnabled(args.perf || args.stats);

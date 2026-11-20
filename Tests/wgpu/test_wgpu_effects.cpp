@@ -334,3 +334,99 @@ TEST_CASE("wgpu custom: a shader that fails to compile warns once and applies it
     golden::GoldenResult same = golden::compareRgba(first.data(), second.data(), 64, 64, 0, 0.0f);
     CHECK(same.pass);
 }
+
+// T-818 (Docs/design/18-effects.md §18.7.x): XtInput.local follows the node's transform, XtInput.uv
+// stays in screen space, XtInput.boxSize is the border box in CSS px (the cases of
+// Tests/gl/test_gl_effects.cpp through xt_wgpu).
+
+namespace {
+
+/// A node with border box (0, 0, `box.x`, `box.y`) drawn through `xf` under a custom effect
+/// (`asset`) whose window is the transformed box's AABB clipped to the viewport.
+CommandList localNodeList(int size, AssetId asset, const std::string& glsl, Mat2x3 xf, Vec2 box) {
+    CommandList cl = makeList(size, size);
+    addShader(cl, asset, glsl, {}, {}, EffectInstance{});
+    Rect aabb = transformBounds(xf, Rect{0, 0, box.x, box.y});
+    aabb = intersect(aabb, cl.viewport);
+    addPushEffect(cl, {customFx(asset, {})}, aabb, aabb);
+    cl.effectCmds.back().xf = xf;
+    cl.effectCmds.back().localBox = Rect{0, 0, box.x, box.y};
+    addFillRect(cl, 0, 0, box.x, box.y, Color{1, 1, 1, 1});
+    cl.fills.back().xf = xf;
+    addPopEffect(cl);
+    return cl;
+}
+
+}  // namespace
+
+TEST_CASE("wgpu custom: XtInput.local follows translation, scale and rotation (T-818)") {
+    const std::string glsl = glslOf(
+        "---\n"
+        "float4 xtMain(XtInput i) {\n"
+        "    return float4(i.local.x, i.local.y, i.boxSize.x / 64, 1);\n"
+        "}\n");
+    Session s(64, 64);
+    // Each transform puts the node's local point (4.5, 12.5) -- (0.28125, 0.78125) in `local` --
+    // on the center of pixel (x, y).
+    struct Case {
+        const char* what;
+        Mat2x3 xf;
+        int x, y;
+    };
+    const Case cases[] = {
+        {"translate (8, 8)", translation(Vec2{8, 8}), 12, 20},
+        {"translate (30, 20)", translation(Vec2{30, 20}), 34, 32},
+        {"scale 2", mul(translation(Vec2{10.5f, 10.5f}), scaling(Vec2{2, 2})), 19, 35},
+        {"rotate 90", mul(translation(Vec2{40, 8}), rotationDeg(90)), 27, 12},
+    };
+    for (const Case& c : cases) {
+        INFO(c.what);
+        const std::vector<uint8_t> a = s.render(localNodeList(64, 5, glsl, c.xf, Vec2{16, 16}));
+        CHECK_MESSAGE(s.warning.empty(), s.warning);
+        CHECK_MESSAGE(s.error.empty(), s.error);
+        CHECK(near(pixel(a, 64, c.x, c.y)[0], 72) <= 2);   // local.x = 4.5 / 16
+        CHECK(near(pixel(a, 64, c.x, c.y)[1], 199) <= 2);  // local.y = 12.5 / 16
+        CHECK(near(pixel(a, 64, c.x, c.y)[2], 64) <= 2);   // boxSize.x / 64
+    }
+}
+
+TEST_CASE("wgpu custom: a full-screen node moved: local follows it, uv does not (T-818)") {
+    const std::string glsl = glslOf(
+        "---\n"
+        "float4 xtMain(XtInput i) {\n"
+        "    return float4(i.uv.x, i.local.x, 0, 1);\n"
+        "}\n");
+    Session s(64, 64);
+    const std::vector<uint8_t> a =
+        s.render(localNodeList(64, 6, glsl, translation(Vec2{0, 0}), Vec2{64, 64}));
+    const std::vector<uint8_t> b =
+        s.render(localNodeList(64, 6, glsl, translation(Vec2{8, 0}), Vec2{64, 64}));
+    CHECK_MESSAGE(s.error.empty(), s.error);
+    CHECK(near(pixel(a, 64, 32, 32)[0], 130) <= 2);  // uv.x = 32.5 / 64
+    CHECK(near(pixel(b, 64, 32, 32)[0], 130) <= 2);  // the window (the viewport) did not move
+    CHECK(near(pixel(a, 64, 32, 32)[1], 130) <= 2);  // local.x = 32.5 / 64
+    CHECK(near(pixel(b, 64, 32, 32)[1], 98) <= 2);   // local.x = 24.5 / 64
+}
+
+TEST_CASE("wgpu custom: XtInput.boxSize is the border box in CSS px at any dpr (T-818)") {
+    const std::string glsl = glslOf(
+        "---\n"
+        "float4 xtMain(XtInput i) {\n"
+        "    return float4(i.boxSize.x / 64, i.boxSize.y / 64, i.local.x, 1);\n"
+        "}\n");
+    for (int dpr : {1, 2}) {
+        INFO("dpr " << dpr);
+        const int size = 64 * dpr;
+        CommandList cl = localNodeList(64, 7, glsl, translation(Vec2{8, 8}), Vec2{16, 32});
+        cl.devicePixelRatio = static_cast<float>(dpr);
+        Session s(size, size);
+        const std::vector<uint8_t> a = s.render(cl);
+        CHECK_MESSAGE(s.error.empty(), s.error);
+        // The device pixel whose center is the local point (4.25, 8.25) at dpr 2, (4.5, 8.5) at dpr 1.
+        const int x = dpr == 2 ? 24 : 12;
+        const int y = dpr == 2 ? 32 : 16;
+        CHECK(near(pixel(a, size, x, y)[0], 64) <= 2);                  // 16 / 64
+        CHECK(near(pixel(a, size, x, y)[1], 128) <= 2);                 // 32 / 64
+        CHECK(near(pixel(a, size, x, y)[2], dpr == 2 ? 68 : 72) <= 2);  // local.x
+    }
+}

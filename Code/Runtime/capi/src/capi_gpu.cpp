@@ -500,8 +500,9 @@ void attachSurface(xt_surface& s, xt_gpu_target& t) {
 
 /// The image variant scale a surface of `t`'s size picks for `bundle` at device pixel ratio 1: the
 /// uiscale applyUiScale (capi_surface.cpp) computes for that size, limited as Context::applyUiScale
-/// limits it (clamp, then the DPI floor x 1), times the ratio 1 -- what FrameBuilder hands the resolver
-/// (dpr x the element's `ui-scale` factor, `auto` = the uiscale).
+/// limits it (clamp, then the DPI floor -- T-820: never multiplied by the dpr, 25 §25.4.2.x), times the
+/// ratio 1 -- what FrameBuilder hands the resolver (dpr x the element's `ui-scale` factor, `auto` = the
+/// uiscale).
 float preloadScale(const xt_gpu_target& t, const xt::bundle::Bundle& bundle) {
     const xt::bundle::BundleSpec* given = bundle.spec();
     const xt::bundle::BundleSpec spec = given != nullptr ? *given : xt::bundle::BundleSpec{};
