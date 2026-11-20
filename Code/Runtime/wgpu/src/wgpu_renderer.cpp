@@ -137,7 +137,7 @@ struct WgpuRenderer::Impl {
             return;
         }
         if (buildFrame(list, shaper, assets, ir, perf, damage)) {
-            submitFrame(target, stats);
+            submitFrame(target, perf);
         }
     }
 
@@ -162,7 +162,8 @@ struct WgpuRenderer::Impl {
     }
 
     /// T-658: the submit half of render(): the built frame into `target`.
-    void submitFrame(WGPUTextureView target, FrameStats* stats) {
+    void submitFrame(WGPUTextureView target, PerfTracker* perf) {
+        FrameStats* stats = (perf != nullptr && perf->enabled()) ? &perf->current() : nullptr;
         if (!initialized || !frameBuilt) {
             lastError = initialized ? "WgpuRenderer::submit: no frame was built"
                                     : "WgpuRenderer::init was not called";
@@ -174,10 +175,13 @@ struct WgpuRenderer::Impl {
         }
         device.setSurface(target);
         const auto s0 = std::chrono::steady_clock::now();
-        const bool timed = timer.enabled();  // T-734: off = the submit of before
-        if (timed) timer.beginFrame(currentFrame, frame.passes.size());
-        device.submit(frame);
-        if (timed) timer.endFrame();
+        {
+            PerfPhaseScope submitScope(perf, &FrameStats::submitMs, &FrameStats::submitCpuMs);  // T-750
+            const bool timed = timer.enabled();  // T-734: off = the submit of before
+            if (timed) timer.beginFrame(currentFrame, frame.passes.size());
+            device.submit(frame);
+            if (timed) timer.endFrame();
+        }
         submitMs = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - s0).count();
         if (device.lastSubmissionIndex() != 0)
             framesInFlight.noteSubmit(device.lastSubmissionIndex());  // T-674
@@ -187,6 +191,7 @@ struct WgpuRenderer::Impl {
             // T-438 item 14: CPU submission time per kind (21 section 21.2).
             stats->effectsMs += device.lastStats().effectsMs;
             stats->textMs += device.lastStats().textMs;
+            noteFrameRecordStats(*stats);  // T-750
         }
         const std::string deviceErrors = takeDeviceErrors();
         if (!deviceErrors.empty()) {
@@ -196,6 +201,33 @@ struct WgpuRenderer::Impl {
         } else if (!device.lastError().empty()) {
             lastError = device.lastError();
         }
+    }
+
+    /// T-750 (57 §57.5 item 2): this submit's backend statistics into the frame's record.
+    void noteFrameRecordStats(FrameStats& f) const {
+        const WgpuDeviceStats& d = device.lastStats();
+        f.backend = static_cast<uint32_t>(PerfBackend::Wgpu);
+        f.submitPlanMs += d.planMs;
+        f.submitUploadMs += d.uploadMs;
+        f.submitEncodeMs += d.encodeMs;
+        f.submitQueueMs += d.queueMs;
+        f.passes += d.passes;
+        f.drawCalls += d.drawCalls;
+        f.pipelineBinds += d.pipelineBinds;
+        f.bindGroups += d.bindGroups;
+        f.uploadBytes = saturateU32(uint64_t(f.uploadBytes) + d.uploadBytes);
+        f.transientCreates += d.transientCreates;
+        f.frameReused += frameReused ? 1u : 0u;
+        if (!frameReused) {
+            const gpu::FrameBuilder::EffectCacheStats c = builder.lastEffectCacheStats();
+            f.effectCacheHits += c.hits;
+            f.effectCacheMisses += c.misses;
+            const gpu::FrameBuilder::CoverageStats cov = builder.lastCoverageStats();
+            f.coverageHits += cov.hits;
+            f.coverageMisses += cov.misses;
+        }
+        f.effectCacheBytes = saturateU32(builder.lastBuildStats().effectCacheBytes);
+        f.transientPoolBytes = saturateU32(d.poolBytes);
     }
 
     bool readback(WGPUTexture texture, std::span<uint8_t> out) {
@@ -334,7 +366,7 @@ void WgpuRenderer::submit(WGPUTextureView target, PerfTracker* perf) {
     FrameStats* stats = (perf != nullptr && perf->enabled()) ? &perf->current() : nullptr;
     PerfFieldScope renderScope(stats != nullptr ? &stats->renderMs : nullptr);
     m_impl->currentFrame = m_impl->frameCounter++;  // T-734
-    m_impl->submitFrame(target, stats);
+    m_impl->submitFrame(target, perf);
 }
 
 void WgpuRenderer::trim() {

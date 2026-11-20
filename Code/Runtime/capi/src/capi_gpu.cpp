@@ -293,6 +293,10 @@ bool gpuDrawCounts(const xt_surface& surface, uint32_t& executed, uint32_t& skip
     return true;
 }
 
+bool gpuWantsAnotherFrame(const xt_surface& surface) {
+    return surface.gpu != nullptr && surface.gpu->repaint;
+}
+
 }  // namespace xt::capi
 
 namespace {
@@ -766,9 +770,14 @@ XT_CAPI xt_gpu_target* xt_gpu_target_create(const xt_gpu_target_desc* desc) {
         }
         if (native.kind != xt::wgpu::WgpuNativeWindow::Kind::None) {
             std::string error;
-            if (!t->window.create(t->init, native, desc->vsync != 0, error)) return failNull(error);
+            // T-749 (10 §10.10.2, T-758 supplement): the composer only draws textured quads over target 0
+            // and never samples it, so the surface is drawn into directly even without TEXTURE_BINDING.
+            if (!t->window.create(t->init, native, desc->vsync != 0, error, xt::wgpu::SurfaceReads::None)) {
+                return failNull(error);
+            }
             t->format = t->window.format();
             t->window.configure(t->init.device, t->width, t->height);
+            xt::capi::log(0, "xt_gpu_target: " + t->window.usageNote());  // T-758
         } else {
             t->format = WGPUTextureFormat_RGBA8Unorm;
             if (!t->createOffscreen()) return failNull("the offscreen texture cannot be created");
@@ -912,7 +921,7 @@ XT_CAPI xt_status xt_gpu_target_readback(xt_gpu_target* t, void* rgba, int strid
                 XT_STATUS_UNSUPPORTED,
                 "xt_gpu_target_readback: a window target is read only between begin_frame and end_frame");
         }
-        if (t->windowed() && (t->window.usage() & WGPUTextureUsage_CopySrc) == 0) {
+        if (t->windowed() && !t->window.frameCopyable()) {
             return fail(XT_STATUS_UNSUPPORTED,
                         "xt_gpu_target_readback: this window's swapchain cannot be copied");
         }

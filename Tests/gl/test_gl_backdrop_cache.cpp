@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <initializer_list>
 #include <string>
 #include <vector>
@@ -228,6 +229,65 @@ TEST_CASE("gl backdrop cache: T-730 a glass panel moving by whole pixels, byte f
             CHECK(maxChannel <= 1);
         } else {
             CHECK(differ == 0u);
+        }
+    }
+}
+
+TEST_CASE("gl backdrop cache: T-764 a panel moving by fractions is sampled bilinearly and settles at rest") {
+    // The pair is read straight from the cached textures (GlDevice::supportsBackdropMaskTextures): the
+    // nearest texel at the same phase, bilinear a fraction of a pixel away (T-730's bounds), then byte for
+    // byte once it has settled.
+    CacheSession s;
+    const float xs[] = {30.0f, 30.25f, 30.5f, 30.75f, 31.125f};
+    Vec2 at{};
+    for (int i = 0; i < 5; ++i) {
+        CAPTURE(i);
+        at = Vec2{xs[i], 20.0f + 0.375f * float(i)};
+        const CommandList cl = glassList(at, 0.0f);
+        const std::vector<uint8_t> px = s.draw(cl);
+        if (i >= 2) {
+            CHECK(s.stats.backdropPairHits == 1u);
+            const std::vector<uint8_t> ref = s.uncached(cl);
+            const int maxChannel = xt::gl::test::maxChannelDiff(px, ref);
+            double sum = 0;
+            for (size_t k = 0; k < px.size() && k < ref.size(); ++k) {
+                sum += std::abs(int(px[k]) - int(ref[k]));
+            }
+            const double mean = px.empty() ? 0.0 : sum / double(px.size());
+            std::printf("T-764 gl phase hit, frame %d: max channel diff %d, mean %.4f\n", i, maxChannel,
+                        mean);
+            CHECK(maxChannel <= 64);
+            CHECK(mean <= 0.25);
+        }
+    }
+    const CommandList rest = glassList(at, 0.0f);
+    const std::vector<uint8_t> reference = s.uncached(rest);
+    CHECK(differing(s.draw(rest), reference) == 0u);  // the settle, in full
+    for (int i = 0; i < 2; ++i) {
+        const std::vector<uint8_t> px = s.draw(rest);
+        CHECK(s.stats.backdropPairHits == 1u);
+        CHECK(differing(px, reference) == 0u);
+    }
+}
+
+TEST_CASE("gl backdrop cache: T-764 a panel cut by the surface edge, at rest and moving by whole pixels") {
+    CacheSession s;
+    for (int i = 0; i < 8; ++i) {
+        CAPTURE(i);
+        const float x = i < 4 ? -40.0f : -40.0f + float(i - 3);
+        const CommandList cl = glassList(Vec2{x, 20.0f}, float(i) * 2.0f);
+        const std::vector<uint8_t> px = s.draw(cl);
+        if (i >= 2 && i < 4) {
+            CHECK(s.stats.backdropPairHits == 1u);
+        }
+        const std::vector<uint8_t> ref = s.uncached(cl);
+        const int maxChannel = xt::gl::test::maxChannelDiff(px, ref);
+        std::printf("T-764 gl edge, frame %d: %u pair hits, max channel %d\n", i, s.stats.backdropPairHits,
+                    maxChannel);
+        if (xt::gl::test::softwareRenderer()) {
+            CHECK(maxChannel <= 1);
+        } else {
+            CHECK(differing(px, ref) == 0u);
         }
     }
 }

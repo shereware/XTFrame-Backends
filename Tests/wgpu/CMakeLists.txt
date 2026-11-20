@@ -21,6 +21,12 @@ add_executable(xt_wgpu_tests
     test_wgpu_fewer_passes.cpp  # T-728
     test_wgpu_backdrop_cache.cpp  # T-730
     test_wgpu_gpu_timing.cpp  # T-734
+    test_wgpu_offscreen_cull.cpp  # T-754
+    test_wgpu_window_surface.cpp  # T-758
+    test_wgpu_space_root.cpp  # T-760
+    test_wgpu_nested_projection.cpp  # T-761
+    test_wgpu_flatten_3d.cpp  # T-762
+    test_wgpu_planar.cpp  # T-806
 )
 target_include_directories(xt_wgpu_tests SYSTEM PRIVATE ${PROJECT_SOURCE_DIR}/Code/SDKs/doctest)
 target_compile_definitions(xt_wgpu_tests PRIVATE DOCTEST_CONFIG_USE_STD_HEADERS)
@@ -31,6 +37,8 @@ target_include_directories(xt_wgpu_tests PRIVATE ${PROJECT_SOURCE_DIR}/Code/Runt
 # T-438: the draw cases compare with xt::sw (golden_common.h's compareRgba) and compile fixtures.
 target_link_libraries(xt_wgpu_tests PRIVATE xt_wgpu xt_gpu xt_core xt_compile xt_sw xt_golden_fixtures)
 target_compile_definitions(xt_wgpu_tests PRIVATE XT_GOLDEN_UI_DIR="${PROJECT_SOURCE_DIR}/Tests/golden/ui")
+# T-762: test_wgpu_flatten_3d.cpp compiles Tests/layout/flat_3d_flatten.xt (flatten_3d_fixtures.h).
+target_compile_definitions(xt_wgpu_tests PRIVATE XT_TEST_LAYOUT_DIR="${PROJECT_SOURCE_DIR}/Tests/layout")
 # T-700: test_wgpu_affine_plane.cpp shapes text with the test fonts.
 target_compile_definitions(xt_wgpu_tests PRIVATE XT_TEST_FONTS_DIR="${PROJECT_SOURCE_DIR}/Tests/fonts")
 # T-687: test_wgpu_pack_bc7.cpp packs a UI Project (xt_bundle) built by Tests/bundle/t687_project.h.

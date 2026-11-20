@@ -12,12 +12,15 @@ add_executable(xt_gl_tests
     test_gl_channel_fold.cpp  # T-728
     test_gl_backdrop_mask.cpp  # T-729
     test_gl_backdrop_cache.cpp  # T-730
+    test_gl_planar.cpp  # T-806
+    test_gl_shutdown.cpp  # T-808
 )
 target_include_directories(xt_gl_tests SYSTEM PRIVATE ${PROJECT_SOURCE_DIR}/Code/SDKs/doctest)
 target_compile_definitions(xt_gl_tests PRIVATE DOCTEST_CONFIG_USE_STD_HEADERS)
 target_compile_definitions(xt_gl_tests PRIVATE
     XT_GOLDEN_EXPECTED_DIR="${PROJECT_SOURCE_DIR}/Tests/golden/expected"
-    XT_GOLDEN_UI_DIR="${PROJECT_SOURCE_DIR}/Tests/golden/ui")
+    XT_GOLDEN_UI_DIR="${PROJECT_SOURCE_DIR}/Tests/golden/ui"
+    XT_TEST_LAYOUT_DIR="${PROJECT_SOURCE_DIR}/Tests/layout")  # T-762: flatten_3d_fixtures.h
 # test_gl_renderer.cpp uses xt_gl's private headers (gl_loader.h) directly to build its own
 # offscreen render target with the same GL function pointers GlRenderer uses.
 target_include_directories(xt_gl_tests PRIVATE ${XT_BACKENDS_SOURCE_DIR}/Code/Runtime/gl/src)

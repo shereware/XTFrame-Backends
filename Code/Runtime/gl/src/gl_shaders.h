@@ -392,6 +392,37 @@ uniform sampler2D uTex;
 }
 )";
 
+/// T-806 (Docs/design/23-host-integration.md §23.aj) `Shading::TexturePlanar`: Y'CbCr 4:2:0 planes
+/// packed in one R8 texture (unit 0), converted to premultiplied RGB while sampling. `uPlanar` is
+/// gpu_frame.h's PlanarParams as 12 vec4: the planes' uv (scale, offset) at 0..3, their clamp
+/// rectangles (texel rectangle inset by half a texel) at 4..7, the matrix rows at 8..10, (hasAlpha,
+/// premultiplied, -, -) at 11. No branch on the matrix, range or siting. Mirrors
+/// Code/Runtime/wgpu/src/shaders/texture_planar.wgsl.
+inline constexpr const char* kTexturePlanarFrag = R"(#version 330 core
+in vec2 vUV;
+in vec4 vColor;
+out vec4 fragColor;
+uniform sampler2D uTex;
+uniform vec4 uPlanar[12];
+)" XT_GL_ANALYTIC_CLIP_COMMON R"(float planeSample(int p) {
+    vec4 m = uPlanar[p];
+    vec4 r = uPlanar[4 + p];
+    return texture(uTex, clamp(vUV * m.xy + m.zw, r.xy, r.zw)).r;
+}
+void main() {
+    vec4 yuv1 = vec4(planeSample(0), planeSample(1), planeSample(2), 1.0);
+    vec3 rgb = clamp(vec3(dot(uPlanar[8], yuv1), dot(uPlanar[9], yuv1), dot(uPlanar[10], yuv1)), 0.0, 1.0);
+    float a = 1.0;
+    if (uPlanar[11].x != 0.0) {
+        a = planeSample(3);
+        if (uPlanar[11].y == 0.0) {
+            rgb *= a;
+        }
+    }
+    fragColor = vec4(rgb, a) * vColor * clipCoverage(vPx);  // T-719: 1 without an analytic clip
+}
+)";
+
 /// `Shading::Glyph`: R8 coverage raised to the run's gamma (Docs/design/23-host-integration.md
 /// §23.4) times the premultiplied text color.
 /// T-178: `uEffect` 1 (Dilate) / 2 (Blur) is a glyph-level text effect of device radius `uRadius`
@@ -943,15 +974,37 @@ void main() {
 // follow it. `uSrc` is R' (the content with those effects), `uBackdrop` the blurred + colour-adjusted
 // backdrop, `uSrcMask` the content alone, whose alpha masks the backdrop:
 // `dst = R' + backdrop * alpha(content) * (1 - alpha(R'))` -- mirrors xt::sw::applyBackdropBlurUnder.
+// T-764 (gpu_frame.h BackdropParams' trailing fields): `uTopMode` / `uMaskMode` 0 = a target sampled at
+// vUV as before; 1 / 2 = a cached texture (top-down, CacheStore) at uvT = uv * scale + offset with uv the
+// window's top-down uv (`uTopUv` / `uMaskUv` = scale.xy, offset.zw), transparent outside [0,1)^2, read as
+// the texel under uvT (1, Sampler::PointClamp) or bilinearly (2, LinearClamp; the device sets the filter).
 inline constexpr const char* kFxBackdropMaskedFrag = R"(#version 330 core
 in vec2 vUV;
 out vec4 fragColor;
 uniform sampler2D uSrc;
 uniform sampler2D uBackdrop;
 uniform sampler2D uSrcMask;
+uniform int uTopMode;
+uniform int uMaskMode;
+uniform vec4 uTopUv;
+uniform vec4 uMaskUv;
+vec4 backdropInput(sampler2D s, int mode, vec4 m) {
+    if (mode == 0) {
+        return texture(s, vUV);
+    }
+    vec2 uv = vec2(vUV.x, 1.0 - vUV.y) * m.xy + m.zw;
+    if (uv.x < 0.0 || uv.y < 0.0 || uv.x >= 1.0 || uv.y >= 1.0) {
+        return vec4(0.0);
+    }
+    if (mode == 1) {
+        ivec2 size = textureSize(s, 0);
+        return texelFetch(s, min(ivec2(floor(uv * vec2(size))), size - ivec2(1)), 0);
+    }
+    return textureLod(s, uv, 0.0);
+}
 void main() {
-    vec4 top = texture(uSrc, vUV);
-    vec4 bottom = texture(uBackdrop, vUV) * texture(uSrcMask, vUV).a;
+    vec4 top = backdropInput(uSrc, uTopMode, uTopUv);
+    vec4 bottom = texture(uBackdrop, vUV) * backdropInput(uSrcMask, uMaskMode, uMaskUv).a;
     float inv = 1.0 - top.a;
     fragColor = vec4(top.rgb + bottom.rgb * inv, top.a + bottom.a * inv);
 }

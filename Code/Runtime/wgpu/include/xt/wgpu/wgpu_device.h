@@ -205,6 +205,11 @@ public:
     bool supportsAlphaChannelReads() const override { return true; }
     /// T-729 (§10.18 B): fx_backdrop_masked takes the content as its third input (t2).
     bool supportsBackdropMask() const override { return true; }
+    /// T-764: fx_backdrop_masked.wgsl samples R' and S from cached textures (BackdropParams' trailing
+    /// fields).
+    bool supportsBackdropMaskTextures() const override { return true; }
+    /// T-806 (Docs/design/23-host-integration.md §23.aj): texture_planar.wgsl draws Shading::TexturePlanar.
+    bool supportsPlanarExternal() const override { return true; }
     /// T-648: image textures through the borrowed WgpuSharedCache (see gpu::GpuDevice). A shared
     /// image's handle is an external entry of this device's table naming the cache's view.
     bool sharesImageTextures() const override { return m_sharing != nullptr; }

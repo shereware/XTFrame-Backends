@@ -81,6 +81,10 @@ private:
         uDstSize,
         uMix,
         uChannel,  // T-728
+        uTopMode,  // T-764
+        uMaskMode,
+        uTopUv,
+        uMaskUv,
         kUniformCount
     };
     struct Program {

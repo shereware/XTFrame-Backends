@@ -299,6 +299,9 @@ void WgpuDevice::drawCmd(WGPURenderPassEncoder pass, const gpu::DrawCmd& cmd, ui
         case Shading::TextureStraight:
             shader = cmd.mipLod != 0 ? detail::kShTextureLod : detail::kShTextureStraight;
             break;
+        case Shading::TexturePlanar:  // T-806: PlanarParams at paramIndex
+            shader = detail::kShTexturePlanar;
+            break;
         case Shading::Glyph:
             shader = detail::kShGlyph;
             break;
@@ -412,6 +415,7 @@ void WgpuDevice::drawCmd(WGPURenderPassEncoder pass, const gpu::DrawCmd& cmd, ui
         case Shading::Texture:
         case Shading::TextureStraight:
         case Shading::ParticleTexture:
+        case Shading::TexturePlanar:  // T-806: t0 = the R8 planes texture
             textureView(cmd.texture, bk.v0, bk.id0);
             bk.sampler = g.pipelines->sampler(cmd.sampler);
             break;
@@ -433,7 +437,17 @@ void WgpuDevice::drawCmd(WGPURenderPassEncoder pass, const gpu::DrawCmd& cmd, ui
             if (cmd.aux != 0) targetView(cmd.aux, bk.v1, bk.id1);
             if (cmd.texture != 0) textureView(cmd.texture, bk.v2, bk.id2);
             if (cmd.program == gpu::EffectProgram::BackdropMasked) {  // T-729: t2 = the content (S)
-                targetView(gpu::backdropMaskTarget(frame, cmd), bk.v2, bk.id2);
+                // T-764: R' (t0) and / or S (t2) may be cached textures; DrawCmd::texture is not used.
+                gpu::BackdropInputs in;
+                gpu::backdropInputs(frame, cmd, in);
+                if (in.topTexture != 0) {
+                    textureView(in.topTexture, bk.v0, bk.id0);
+                }
+                if (in.maskTexture != 0) {
+                    textureView(in.maskTexture, bk.v2, bk.id2);
+                } else {
+                    targetView(in.maskTarget, bk.v2, bk.id2);
+                }
             }
             break;
         default:

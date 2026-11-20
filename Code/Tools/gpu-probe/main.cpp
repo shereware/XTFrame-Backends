@@ -50,6 +50,16 @@
 // wait (wall - CPU); the GPU span and pass sum from the timestamps; the process's CPU time against the
 // main thread's (the other threads: driver, runtime). `--timing-csv <file>` writes one row per frame.
 // Without `--timing` the output is unchanged.
+//
+// T-750 (Docs/design/57-measurement.md §57.2, §57.5): with `--timing` the Context's PerfTracker is on
+// (thread CPU timing too) and handed to the renderer, the frames are marked (after the waits), a
+// `frame record` block compares the meters with FrameRecord v1, and `--timing-csv` writes FrameRecord
+// v1 through the runtime's column table with the meters and GPU timestamps as `host.*` columns.
+//
+// T-754 (Docs/design/10-backends.md §10.20 rule 7): like xtframe-view, the probe hands the manifest's
+// `spec.safeArea` to Context::setDevice (xt::tools::specSafeArea; a bundle without a spec keeps no safe
+// area) and prints the value used; `--safe <ratio>` overrides it (`--safe 0`: none). Behaviour change:
+// before T-754 the probe applied no safe area, so its War Table numbers differ from earlier runs.
 
 #include <algorithm>
 #include <chrono>
@@ -66,6 +76,7 @@
 #include <vector>
 
 #include "../Common/console_utf8.h"
+#include "../Common/spec_safe_area.h"
 #include "../view/view_events.h"
 #include "xt/bundle/bundle.h"
 #include "xt/command_list.h"
@@ -201,6 +212,7 @@ struct FrameNumbers {
     /// T-721 (10 §10.16 W2 item 7): the effect cache of the builds -- segments served / drawn in full,
     /// hits pasted a fraction of a pixel away, segments drawn again once at rest.
     double fxHits = 0, fxMisses = 0, fxPhaseHits = 0, fxSettles = 0;
+    double culled = 0;  ///< T-754: effects and layers left out as offscreen (BuildStats::culledOffscreen)
     int n = 0;
     void add(const FrameNumbers& o) {
         buildMs += o.buildMs;
@@ -227,6 +239,7 @@ struct FrameNumbers {
         fxMisses += o.fxMisses;
         fxPhaseHits += o.fxPhaseHits;
         fxSettles += o.fxSettles;
+        culled += o.culled;
         ++n;
     }
     void print(const char* title) const {
@@ -243,8 +256,9 @@ struct FrameNumbers {
             transients / d, transientMpx / d, fillMpx / d);
         std::printf("  textures created %.2f destroyed %.2f updated %.2f upload %.1f KB\n", created / d,
                     destroyed / d, updates / d, uploadKb / d);
-        std::printf("  effect cache hits %.2f misses %.2f | phase hits %.2f settles %.2f\n", fxHits / d,
-                    fxMisses / d, fxPhaseHits / d, fxSettles / d);
+        std::printf(
+            "  effect cache hits %.2f misses %.2f | phase hits %.2f settles %.2f | culled offscreen %.2f\n",
+            fxHits / d, fxMisses / d, fxPhaseHits / d, fxSettles / d, culled / d);
     }
 };
 
@@ -276,6 +290,8 @@ struct FrameDriver {
         }
         ctx.update(dt);
         if (flows != nullptr) {
+            // T-750: FrameRecord's `flow` phase (nothing while the tracker is off).
+            xt::PerfPhaseScope flowScope(ctx.perf(), &xt::FrameStats::flowMs, &xt::FrameStats::flowCpuMs);
             flows->tick(dt);
         }
     }
@@ -688,24 +704,30 @@ int runWgpu(xt::Context& ctx, xt::DocumentHandle doc, FrameDriver& driver, xt::t
     std::printf("WGPU: %s | target %dx%d, %u sample(s)\n", renderer.adapterName(), width, height,
                 options.sampleCount);
     // T-734: --timing -- the thread clock, GPU timestamps, one record per frame.
-    probe_timing::ThreadClock clock;
+    // T-750: the Context's tracker records FrameRecord v1 (with the thread clock the meters use) and is
+    // handed to the renderer; off (and not handed over) without --timing, as before.
+    xt::PerfTracker& perf = ctx.perf();
+    xt::PerfTracker* rendererPerf = timing ? &perf : nullptr;
+    std::vector<xt::FrameRecord> records;
     probe_timing::RunInfo tinfo;
     std::vector<probe_timing::FrameTiming> tframes;
     std::vector<xt::wgpu::WgpuGpuTiming> gpuTimes;
     double proc0 = 0, thread0 = 0;
     if (timing) {
-        clock.calibrate();
+        perf.setEnabled(true);
+        perf.setThreadCpuTiming(true);  // calibrates the clock once
         tinfo.finish = finish;
-        tinfo.clock = clock.describe();
+        tinfo.clock = probe_timing::describeClock(perf.threadClock());
         tinfo.gpuOn = renderer.setGpuTiming(true);
         tinfo.periodNs = double(wgpuQueueGetTimestampPeriod(init.queue));
         std::printf("timing: %s; %s\n", tinfo.clock.c_str(),
                     tinfo.gpuOn ? "GPU timestamps on"
                                 : "GPU timestamps unsupported by this device (CPU phases only)");
         tframes.resize(size_t(frames));
+        records.resize(size_t(frames));
     }
     probe_timing::PhaseMeter meter;
-    meter.clock = &clock;
+    meter.clock = &perf.threadClock();
     auto takeGpu = [&]() {
         gpuTimes.clear();
         renderer.takeGpuTimings(gpuTimes);
@@ -727,6 +749,7 @@ int runWgpu(xt::Context& ctx, xt::DocumentHandle doc, FrameDriver& driver, xt::t
         if (timing && f == warmup) tinfo.processOk = probe_timing::processTimes(proc0, thread0);
         probe_timing::FrameTiming* tf = timing ? &tframes[size_t(f)] : nullptr;
         if (tf) meter.start();
+        if (tf) perf.markFrameStart();  // T-750
         driver.update(f);
         if (tf) {
             meter.stop(*tf, probe_timing::kUpdate);
@@ -737,12 +760,15 @@ int runWgpu(xt::Context& ctx, xt::DocumentHandle doc, FrameDriver& driver, xt::t
         const xt::Document* pDoc = ctx.document(doc);
         const auto t0 = std::chrono::steady_clock::now();
         if (tf) meter.start();
-        renderer.framesInFlight().beginFrame(init.device, init.queue);
+        {
+            xt::PerfPhaseScope waitScope(rendererPerf, &xt::FrameStats::waitMs, &xt::FrameStats::waitCpuMs);
+            renderer.framesInFlight().beginFrame(init.device, init.queue);
+        }
         if (tf) {
             meter.stop(*tf, probe_timing::kInflightWait);
             meter.start();
         }
-        renderer.render(list, &shaper, &bundle.assets(), view, pDoc ? &pDoc->ir() : nullptr, nullptr,
+        renderer.render(list, &shaper, &bundle.assets(), view, pDoc ? &pDoc->ir() : nullptr, rendererPerf,
                         &damage);
         if (tf) {
             meter.stop(*tf, probe_timing::kRender);
@@ -753,8 +779,17 @@ int runWgpu(xt::Context& ctx, xt::DocumentHandle doc, FrameDriver& driver, xt::t
         const auto t1 = std::chrono::steady_clock::now();
         if (finish) {
             if (tf) meter.start();
-            wgpuDevicePoll(init.device, 1, nullptr);
+            {
+                xt::PerfPhaseScope waitScope(rendererPerf, &xt::FrameStats::waitMs,
+                                             &xt::FrameStats::waitCpuMs);
+                wgpuDevicePoll(init.device, 1, nullptr);
+            }
             if (tf) meter.stop(*tf, probe_timing::kQueueWait);
+        }
+        if (tf) {  // T-750: the frame ends after the waits (57 §57.2 item 2, ruling 3)
+            perf.markFrameEnd();
+            records[size_t(f)] = xt::makeFrameRecord(perf.current());
+            records[size_t(f)].steady = f >= warmup ? 1u : 0u;
         }
         const auto t2 = std::chrono::steady_clock::now();
         if (tf && tinfo.gpuOn) takeGpu();
@@ -855,8 +890,9 @@ int runWgpu(xt::Context& ctx, xt::DocumentHandle doc, FrameDriver& driver, xt::t
             processMemoryNote().c_str());
     }
     if (timing) {
-        probe_timing::printTiming(tframes, warmup, tinfo);  // T-734
-        if (!timingCsv.empty() && !probe_timing::writeCsv(timingCsv, tframes, warmup)) {
+        probe_timing::printTiming(tframes, warmup, tinfo);                     // T-734
+        probe_timing::printRecordAgreement(tframes, records, warmup, finish);  // T-750
+        if (!timingCsv.empty() && !probe_timing::writeCsv(timingCsv, tframes, records, warmup)) {
             std::fprintf(stderr, "xtframe-gpu-probe: cannot write '%s'\n", timingCsv.c_str());
         }
     }
@@ -880,7 +916,8 @@ static int run(int argc, char** argv) {
                      "                         [--gl [--msaa <0|2|4|8>] [--no-finish] [--warmup <frames>]]\n"
                      "                         [--wgpu [--msaa <0|4>] [--no-finish] [--warmup <frames>]\n"
                      "                                 [--timing [--timing-csv <file>]]]\n"
-                     "                         [--flow] [--event \"<frame> #<id>.<Event>\"]...\n");
+                     "                         [--flow] [--event \"<frame> #<id>.<Event>\"]...\n"
+                     "                         [--safe <ratio>]\n");
         return 2;
     }
     const std::string dir = argv[1];
@@ -896,6 +933,8 @@ static int run(int argc, char** argv) {
     bool timing = false;                                 // T-734
     std::string timingCsv;                               // T-734
     std::vector<xt::tools::view::ScriptedEvent> events;  // T-713
+    bool safeGiven = false;                              // T-754
+    xt::Insets safeArea{};                               // T-754
     xt::tools::view::eventToolName() = "xtframe-gpu-probe";
     for (int i = 3; i < argc; ++i) {
         if (std::strcmp(argv[i], "--flow") == 0) {
@@ -906,6 +945,13 @@ static int run(int argc, char** argv) {
                 return 2;
             }
             events.push_back(std::move(event));
+        } else if (std::strcmp(argv[i], "--safe") == 0 && i + 1 < argc) {
+            if (!xt::tools::parseSafeRatio(argv[++i], safeArea)) {
+                std::fprintf(stderr, "xtframe-gpu-probe: --safe takes a fraction in [0, 0.5], got '%s'\n",
+                             argv[i]);
+                return 2;
+            }
+            safeGiven = true;
         } else if (std::strcmp(argv[i], "--dump") == 0 && i + 1 < argc) {
             dumpPath = argv[++i];
         } else if (std::strcmp(argv[i], "--wgpu") == 0) {
@@ -950,6 +996,15 @@ static int run(int argc, char** argv) {
     xt::text::FtTextShaper shaper;
     shaper.addSystemFonts();
     xt::Context ctx(xt::ContextConfig{&shaper, &bundle->assets()});
+    // T-754: the manifest's safe area (as xtframe-view applies it), unless --safe gives one.
+    if (!safeGiven && bundle->spec() != nullptr) {
+        safeArea = xt::tools::specSafeArea(*bundle->spec(), xt::DeviceKind::Desktop);
+    }
+    xt::DeviceInfo deviceInfo;
+    deviceInfo.safeArea = safeArea;
+    ctx.setDevice(deviceInfo);
+    std::printf("safe area %g (%s)\n", double(safeArea.top),
+                safeGiven ? "--safe" : (bundle->spec() != nullptr ? "manifest spec" : "no spec"));
     xt::Result<xt::DocumentHandle> loaded = xt::bundle::loadUi(ctx, *bundle, uiId);
     if (!loaded.ok()) {
         std::fprintf(stderr, "cannot load ui '%s' (%s)\n", uiId.c_str(), xt::statusName(loaded.status()));
@@ -1052,6 +1107,7 @@ static int run(int argc, char** argv) {
             n.fxMisses = fx.misses;
             n.fxPhaseHits = bs.effectCachePhaseHits;
             n.fxSettles = bs.effectCacheSettles;
+            n.culled = bs.culledOffscreen;  // T-754
         }
         n.passes = double(frame.passes.size());
         n.cmds = double(frame.cmds.size());
@@ -1073,6 +1129,7 @@ static int run(int argc, char** argv) {
                 case xt::gpu::Shading::TextureStraight:
                 case xt::gpu::Shading::ParticleTexture:  // T-202: one instanced draw each.
                 case xt::gpu::Shading::ParticleSolid:
+                case xt::gpu::Shading::TexturePlanar:  // T-806
                     n.texture += 1;
                     break;
                 case xt::gpu::Shading::Glyph:

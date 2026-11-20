@@ -75,6 +75,7 @@ bool GlDevice::linkMain(Program& p, const char* frag, std::string& err) {
     p.uTerms = glGetUniformLocation(p.id, "uTerms");
     p.uClipCount = glGetUniformLocation(p.id, "uClipCount");  // T-719 (the leaf programs).
     p.uClip = glGetUniformLocation(p.id, "uClip");
+    p.uPlanar = glGetUniformLocation(p.id, "uPlanar");  // T-806 (kTexturePlanarFrag only).
     // Sampler units and the LUT width never change (T-159): set once. A -1 location is a no-op.
     glUseProgram(p.id);
     glUniform1i(glGetUniformLocation(p.id, "uTex"), 0);
@@ -113,6 +114,7 @@ bool GlDevice::init(std::string& err) {
                     linkMain(m_coverageGradient, shaders::kCoverageGradientFrag, err) &&
                     linkMain(m_boxShadow, shaders::kBoxShadowFrag, err) &&
                     linkMain(m_boxShadowMulti, shaders::kBoxShadowMultiFrag, err) &&  // T-683
+                    linkMain(m_texturePlanar, shaders::kTexturePlanarFrag, err) &&    // T-806
                     linkParticle(m_particleTexture, shaders::kParticleTextureFrag, err) &&
                     linkParticle(m_particleSolid, shaders::kParticleSolidFrag, err);
     bool compositeOk = false;
@@ -261,9 +263,10 @@ void GlDevice::shutdown() {
     if (m_particleVao != 0) glDeleteVertexArrays(1, &m_particleVao);
     m_particleVbo = m_particleVao = 0;
     m_particleCapacity = 0;
-    Program* progs[] = {&m_solid,      &m_gradient, &m_texture,       &m_textureStraight,  &m_glyph,
-                        &m_composite,  &m_resolve,  &m_coverageSolid, &m_coverageGradient, &m_boxShadow,
-                        &m_textureLod, &m_mipBox};
+    Program* progs[] = {&m_solid,         &m_gradient, &m_texture,       &m_textureStraight,  &m_glyph,
+                        &m_composite,     &m_resolve,  &m_coverageSolid, &m_coverageGradient, &m_boxShadow,
+                        &m_textureLod,    &m_mipBox,   &m_texturePlanar,  // T-806
+                        &m_boxShadowMulti};                               // T-808
     if (m_mipFbo != 0) glDeleteFramebuffers(1, &m_mipFbo);
     m_mipFbo = 0;
     m_pendingMips.clear();
@@ -1142,8 +1145,11 @@ void GlDevice::drawCmd(const gpu::DrawCmd& cmd) {
         srcTex = textureOf(cmd.src);
         auxTex = cmd.aux != 0 ? textureOf(cmd.aux) : 0;
         if (cmd.program == gpu::EffectProgram::BackdropMasked) {  // T-729: the content (S) on unit 2
-            const gpu::TargetHandle mask = gpu::backdropMaskTarget(*m_frame, cmd);
-            unit2Tex = mask != 0 ? textureOf(mask) : 0;
+            gpu::BackdropInputs in;  // T-764: R' (unit 0) and / or S (unit 2) may be cached textures
+            gpu::backdropInputs(*m_frame, cmd, in);
+            srcTex = in.topTexture != 0 ? cachedTextureInput(in.topTexture, 0, in.params.topSampler) : srcTex;
+            unit2Tex = in.maskTexture != 0 ? cachedTextureInput(in.maskTexture, 2, in.params.maskSampler)
+                                           : (in.maskTarget != 0 ? textureOf(in.maskTarget) : 0);
         }
         m_cache.bindDrawFramebuffer(m_currentFbo);
         m_cache.viewport(m_passViewport[0], m_passViewport[1], m_passViewport[2], m_passViewport[3]);
@@ -1216,6 +1222,9 @@ void GlDevice::drawCmd(const gpu::DrawCmd& cmd) {
             m_geometry.drawRange(cmd.firstIndex, cmd.indexCount, cmd.baseVertex, m_cache.stats);
             return;
         }
+        case Shading::TexturePlanar:
+            drawPlanar(cmd);  // T-806 (gl_planar.cpp)
+            return;
         case Shading::Glyph: {
             size_t avail = 0;
             const float* p = paramsAt(cmd.paramIndex, avail);

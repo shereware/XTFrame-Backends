@@ -14,6 +14,7 @@
 #include "golden_common.h"
 #include "xt/asset_resolver.h"
 #include "xt/command_list.h"
+#include "xt/compile/ir_writer.h"
 #include "xt/compile/xtfx.h"
 #include "xt/gl/gl_renderer.h"
 #include "xt/ir.h"
@@ -1084,6 +1085,133 @@ TEST_CASE("gl effects: T-162 a cached effect result draws the same pixels as the
     target.destroy();
 }
 
+namespace {
+
+/// T-746: an IR whose asset 0 is `engine://scene`.
+std::vector<uint8_t> irWithEngineAsset() {
+    compile::IrWriter writer;
+    compile::AssetBuilder asset;
+    asset.name = writer.intern("engine://scene");
+    asset.kind = 0;
+    writer.addAsset(asset);
+    compile::SceneBuilder scene;
+    scene.width = 64;
+    scene.height = 64;
+    writer.addScene(scene);
+    return writer.finish();
+}
+
+class ExternalResolver : public AssetResolver {
+public:
+    bool readBytes(std::string_view, std::vector<uint8_t>&) override { return false; }
+    bool decodeImage(AssetId, const IrView&, ImageData&) override { return false; }
+    Vec2 imageSize(AssetId, const IrView&) override { return Vec2{0, 0}; }
+};
+
+/// T-746: (re)fills the 4 x 4 GL texture `tex` with a checker of `a` and `b` (opaque RGB).
+void fillHostTexture(gl::GLuint tex, const uint8_t a[3], const uint8_t b[3]) {
+    using namespace xt::gl;
+    std::vector<uint8_t> px;
+    for (int y = 0; y < 4; ++y) {
+        for (int x = 0; x < 4; ++x) {
+            const uint8_t* c = ((x + y) & 1) != 0 ? a : b;
+            px.insert(px.end(), {c[0], c[1], c[2], 255});
+        }
+    }
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, static_cast<GLint>(GL_RGBA8), 4, 4, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                 px.data());
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, static_cast<GLint>(GL_LINEAR));
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, static_cast<GLint>(GL_LINEAR));
+}
+
+}  // namespace
+
+TEST_CASE(
+    "gl effects: T-746 an effect over a versioned host texture is cached and redrawn on a new version") {
+    constexpr int kSize = 64;
+    CommandList cl = makeList();
+    addFillRect(cl, 0, 0, 64, 64, Color{0.2f, 0.2f, 0.2f, 1});
+    addPushEffect(cl, {dropShadow(3, 3, 2, 0, 0.8f, Color{0, 0, 0, 1})}, Mat2x3{}, Rect{8, 8, 48, 48},
+                  Rect{16, 16, 32, 32});
+    ImageCmd img{};
+    img.xf = Mat2x3{};
+    img.asset = 0;
+    img.dst = Rect{16, 16, 32, 32};
+    img.srcUv = Rect{0, 0, 1, 1};
+    img.opacity = 1;
+    img.smooth = 1;
+    cl.images.push_back(img);
+    cl.commands.push_back(Command{CmdKind::DrawImage, {}, static_cast<uint32_t>(cl.images.size() - 1)});
+    addPopEffect(cl);
+    const std::vector<uint8_t> irBytes = irWithEngineAsset();
+    Result<IrView> ir = IrView::open(IrBlob{irBytes.data(), irBytes.size()});
+    REQUIRE(ir.ok());
+
+    static bool loaded = false;
+    if (!loaded) {
+        REQUIRE(xt::gl::loadGl(sdlLoadProc));
+        loaded = true;
+    }
+    GlTestTarget target;
+    target.init(kSize, kSize);
+    gl::GLuint tex = 0;
+    gl::glGenTextures(1, &tex);
+    const uint8_t red[3] = {255, 40, 20}, yellow[3] = {240, 220, 40};
+    const uint8_t blue[3] = {30, 120, 255}, white[3] = {255, 255, 255};
+    fillHostTexture(tex, red, yellow);
+    ExternalResolver assets;
+    assets.setExternalTexture("scene", tex, 4, 4);
+    assets.setExternalTextureVersion("scene", 1);
+
+    gl::GlRenderer renderer;
+    REQUIRE(renderer.init(sdlLoadProc));
+    renderer.resize(kSize, kSize);
+    auto renderWith = [&](gl::GlRenderer& r) {
+        target.bindAndClear(Color{0, 0, 0, 1});
+        r.render(cl, nullptr, &assets, &ir.value());
+        CHECK(r.lastError()[0] == '\0');
+        return target.readback();
+    };
+    // The frame drawn by a renderer that has never seen the list (no cache).
+    auto uncached = [&] {
+        gl::GlRenderer fresh;
+        REQUIRE(fresh.init(sdlLoadProc));
+        fresh.resize(kSize, kSize);
+        std::vector<uint8_t> px = renderWith(fresh);
+        CHECK(fresh.frameStats().cacheStores == 0);
+        fresh.shutdown();
+        return px;
+    };
+    const std::vector<uint8_t> reference = uncached();
+    std::vector<uint8_t> px = renderWith(renderer);
+    px = renderWith(renderer);
+    CHECK(renderer.frameStats().cacheStores == 1);  // stored on its second appearance
+    px = renderWith(renderer);
+    CHECK(renderer.frameStats().cacheStores == 0);
+    CHECK(renderer.frameStats().passes == 1);  // pasted from the cache: the surface pass only
+    CHECK(golden::compareRgba(px.data(), reference.data(), kSize, kSize, 0, 0.0f).pass);
+
+    // New content and a raised version: drawn in full from the new texels again.
+    fillHostTexture(tex, blue, white);
+    assets.setExternalTextureVersion("scene", 2);
+    px = renderWith(renderer);
+    CHECK(renderer.frameStats().passes > 1);
+    const std::vector<uint8_t> nextReference = uncached();
+    CHECK(golden::compareRgba(px.data(), nextReference.data(), kSize, kSize, 0, 0.0f).pass);
+    CHECK_FALSE(golden::compareRgba(px.data(), reference.data(), kSize, kSize, 0, 0.0f).pass);
+    px = renderWith(renderer);
+    px = renderWith(renderer);
+    CHECK(renderer.frameStats().passes == 1);
+    CHECK(golden::compareRgba(px.data(), nextReference.data(), kSize, kSize, 0, 0.0f).pass);
+
+    renderer.shutdown();
+    gl::glDeleteTextures(1, &tex);
+    target.destroy();
+}
+
 TEST_CASE("gl effects: T-162 the cache leaves the host's framebuffer bound and keeps MSAA transients") {
     constexpr int kSize = 64, kSamples = 4;
     static bool loaded = false;
@@ -1804,4 +1932,39 @@ TEST_CASE("gl golden: ui_plane_2d_persp equals ui_plane_2d_wrapped pixel for pix
             << r.diffPixels << " px differ, max channel diff " << r.maxChannelDiff);
     CHECK(r.diffPixels == 0u);
     checkGlMatchesSwGolden("ui_plane_2d_wrapped", 16, 0.03f);
+}
+
+// T-754 (Docs/design/10-backends.md §10.20, Docs/tasks/T-754.md "測試"): sections whose bounds are known
+// to lie wholly outside the viewport (boundsKnown, empty clamped hint) are not drawn -- the same pixels
+// as the whole-surface fallback an unknown, empty hint gets, and the same as xt::sw.
+TEST_CASE("gl effects: T-754 layers and effects with known, empty bounds are not drawn") {
+    auto scene = [](bool known) {
+        CommandList cl = makeList();
+        addFillRect(cl, 0, 0, 64, 64, Color{0.9f, 0.85f, 0.7f, 1});
+        const EffectInstance shadow = dropShadow(3, 3, 6, 0, 1, Color{0, 0, 0, 0.7f});
+        addPushEffect(cl, {shadow}, Mat2x3{}, Rect{8, 8, 40, 36}, Rect{16, 16, 24, 20});
+        cl.effectCmds.back().boundsKnown = 1;
+        addFillRect(cl, 16, 16, 24, 20, Color{0.2f, 0.4f, 0.9f, 1});
+        addPopEffect(cl);
+        addPushEffect(cl, {shadow}, Mat2x3{}, Rect{0, 20, 0, 36}, Rect{-60, 28, 30, 20});
+        cl.effectCmds.back().boundsKnown = known ? 1 : 0;
+        addFillRect(cl, -60, 28, 30, 20, Color{1, 0, 0, 1});
+        addPopEffect(cl);
+        addPushLayer(cl, 0.5f, BlendMode::Normal, Rect{10, 0, 40, 0});
+        cl.layers.back().boundsKnown = known ? 1 : 0;
+        addFillRect(cl, 10, -50, 40, 20, Color{0, 1, 0, 1});
+        addPopLayer(cl);
+        addPushEffect(cl, {backdropBlur(8, 1, 1)}, Mat2x3{}, Rect{64, 10, 0, 30}, Rect{74, 10, 30, 30});
+        cl.effectCmds.back().boundsKnown = known ? 1 : 0;
+        addFillRect(cl, 74, 10, 30, 30, Color{1, 1, 1, 0.4f});
+        addPopEffect(cl);
+        return cl;
+    };
+    const CommandList before = scene(false);
+    const CommandList after = scene(true);
+    const std::vector<uint8_t> oldPx = renderGlTopDown(before, 64, 64);
+    const std::vector<uint8_t> newPx = renderGlTopDown(after, 64, 64);
+    CHECK(newPx == oldPx);
+    checkGlMatchesSw(after, 64, 64);
+    CHECK(renderSw(after, 64, 64) == renderSw(before, 64, 64));
 }

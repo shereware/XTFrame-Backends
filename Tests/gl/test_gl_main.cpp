@@ -8,6 +8,7 @@
 #include "doctest.h"
 #include "gl_loader.h"
 #include "test_temp.h"
+#include "test_visual_check.h"
 #include "test_watchdog.h"
 
 /// xt_gl_tests: a standalone doctest executable that needs a real GL context before any TEST_CASE
@@ -100,6 +101,7 @@ int main(int argc, char** argv) {
 
     // T-267d: the per-case watchdog (Tests/common/test_watchdog.h) and the temp root clean-up.
     xt::test::startWatchdog();
+    xt::test::enableVisualCheck();  // T-748: the static skip's verify mode in every Context.
     doctest::Context ctx;
     ctx.applyCommandLine(argc, argv);
     int result = ctx.run();

@@ -104,6 +104,34 @@ if(TARGET xtframe-view)
         set_tests_properties(xtframe-view_renderer_compare_${_a}_${_b} PROPERTIES
                              FIXTURES_REQUIRED xt_view_renderer_shots)
     endforeach()
+    # T-759: an `xtframe-pack --atlas` bundle draws byte-identical to the plain one, per renderer
+    # (view_atlas.cmake): atlas_view.xt (<img>, background image, border-image) on every renderer,
+    # atlas_view_particles.xt (a textured emitter) on gl and wgpu.
+    # Known issue (sw particles only): emitParticles passes the atlas cell's sub-UV as the instance's
+    # uv0 / uv1, and the software rasteriser's float rounding of those page coordinates differs from
+    # the file's 0..1 by one level on a few pixels (2 px, max 1 when this was written). The sw
+    # particle scene therefore allows at most 8 px differing by at most 1; nothing else does.
+    if(TARGET xtframe-pack)
+        foreach(_r IN LISTS _renderers)
+            foreach(_scene atlas_view atlas_view_particles)
+                set(_entries 3)
+                set(_tolerance "")
+                if(_scene STREQUAL "atlas_view_particles")
+                    set(_entries 1)
+                    if(_r STREQUAL "sw")
+                        set(_tolerance -DCOMPARE=$<TARGET_FILE:xt_backends_tests> -DMAXDIFF=1 -DMAXPIXELS=8)
+                    endif()
+                endif()
+                add_test(NAME xtframe-view_${_scene}_${_r}
+                         COMMAND ${CMAKE_COMMAND} -DPACK=$<TARGET_FILE:xtframe-pack> -DVIEW=${_view}
+                                 -DSRC=${CMAKE_CURRENT_SOURCE_DIR}/fixtures/atlas_view/${_scene}.xt
+                                 -DOUT=${CMAKE_BINARY_DIR}/xtframe-view-${_scene}-${_r} -DRENDERER=${_r}
+                                 -DENTRIES=${_entries} ${_tolerance}
+                                 -P "${CMAKE_CURRENT_SOURCE_DIR}/view_atlas.cmake")
+                set_tests_properties(xtframe-view_${_scene}_${_r} PROPERTIES TIMEOUT 300)
+            endforeach()
+        endforeach()
+    endif()
 endif()
 
 # T-713: xtframe-gpu-probe smoke tests over two bundles packed at test time (the cache in the build tree,

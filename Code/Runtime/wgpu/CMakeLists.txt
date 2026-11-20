@@ -11,6 +11,7 @@ set(XT_WGSL_SOURCES
     src/shaders/texture.wgsl
     src/shaders/texture_straight.wgsl
     src/shaders/texture_lod.wgsl  # T-665
+    src/shaders/texture_planar.wgsl  # T-806
     src/shaders/glyph.wgsl
     src/shaders/composite.wgsl
     src/shaders/particle_texture.wgsl

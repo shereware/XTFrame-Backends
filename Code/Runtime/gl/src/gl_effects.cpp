@@ -26,7 +26,8 @@ const char* const kUniformNames[] = {
     "uOpacity", "uLutWidth",       "uFbSize",    "uInvXf",       "uP0",           "uP1",       "uRadial",
     "uCenter",  "uEdge0",          "uEdge1",     "uColor",       "uIntensity",    "uOffsetUV", "uScale",
     "uColorA",  "uEffectAlphaMul", "uLineOnTop", "uMaskOutside", "uPosition",     "uSoftness", "uMode",
-    "uSrcSize", "uDstSize",        "uMix",       "uChannel",
+    "uSrcSize", "uDstSize",        "uMix",       "uChannel",     "uTopMode",      "uMaskMode", "uTopUv",
+    "uMaskUv",
 };
 
 }  // namespace
@@ -242,8 +243,21 @@ bool EffectPrograms::bind(gpu::EffectProgram program, const float* params, size_
             return true;
         }
         case EffectProgram::Backdrop:
-        case EffectProgram::BackdropMasked:  // T-729: its third input is `lutTex` (unit 2)
             return true;
+        case EffectProgram::BackdropMasked: {  // T-729: its third input is `lutTex` (unit 2)
+            // T-764: texture inputs (the caller bound them to units 0 / 2 and set a bilinear one's filter).
+            gpu::BackdropParams bp{};
+            const bool textured = gpu::readBackdropTextured(params, available, bp);
+            auto mode = [textured](float isTexture, float sampler) {
+                if (!textured || isTexture == 0.0f) return 0;
+                return sampler == static_cast<float>(gpu::Sampler::PointClamp) ? 1 : 2;
+            };
+            u.set1i(L[uTopMode], mode(bp.topIsTexture, bp.topSampler));
+            u.set1i(L[uMaskMode], mode(bp.maskIsTexture, bp.maskSampler));
+            u.set4f(L[uTopUv], bp.topUv[0], bp.topUv[1], bp.topUv[2], bp.topUv[3]);
+            u.set4f(L[uMaskUv], bp.maskUv[0], bp.maskUv[1], bp.maskUv[2], bp.maskUv[3]);
+            return true;
+        }
         case EffectProgram::MaskApply: {
             gpu::MaskApplyParams mp{};
             if (!readParams(params, available, mp)) return false;

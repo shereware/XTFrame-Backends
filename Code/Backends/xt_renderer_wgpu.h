@@ -35,12 +35,14 @@ class GlyphAtlas;
 /// Device: `WgpuInit::headless()` -- the one place that reads XT_WGPU_BACKEND and XT_WGPU_FALLBACK
 /// (10 §10.10.1) -- then the surface is created on that instance and checked against the adapter.
 /// Surface: `xt::wgpu::WgpuWindowSurface` (format, usage and present mode as its header says;
-/// COPY_SRC when offered, so `readPixels` works on a window), reconfigured on resize and on an
-/// outdated / lost texture.
+/// COPY_SRC when offered, so `readPixels` works on a window; TEXTURE_BINDING when offered, else the
+/// frames go through an intermediate texture, T-758), reconfigured on resize and on an outdated / lost
+/// texture. `create` prints the surface's usages and which way frames reach it (stderr).
 /// Frames in flight (T-674): `beginFrame` waits while the GPU is more than two frames behind
 /// (`xt::wgpu::WgpuFramesInFlight` of the renderer), `present` ends the frame, `destroy` waits for all.
-/// 4x MSAA is done inside WgpuDevice (a 4x attachment resolving into the frame's view); every frame
-/// clears, so a 4x surface never needs the host-content load that would ask for TEXTURE_BINDING.
+/// 4x MSAA is done inside WgpuDevice (a 4x attachment resolving into the frame's view). Frames sample
+/// the frame's view (mix-blend backdrops, backdrop blur, a 4x load without a clear), hence the
+/// TEXTURE_BINDING or the intermediate above (10 §10.20 2026-11-18 note (1)).
 
 namespace xt::backend {
 
@@ -83,7 +85,8 @@ public:
     void render(const CommandList& list, TextShaper* shaper, AssetResolver* assets,
                 const IrView* ir = nullptr, PerfTracker* perf = nullptr, const DamageList* damage = nullptr);
     /// Copies the frame's texture into `rgba` (premultiplied RGBA8, row 0 = top): a surface between
-    /// render and present (false when it has no COPY_SRC), the offscreen texture at any time.
+    /// render and present (false when frames are drawn into a surface without COPY_SRC; T-758: the
+    /// intermediate texture when the surface has one), the offscreen texture at any time.
     bool readPixels(std::vector<uint8_t>& rgba, int& width, int& height);
     void present();
 

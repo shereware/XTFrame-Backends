@@ -27,6 +27,8 @@
 #endif
 
 #include "xt/compile/utf8_path.h"
+#include "xt/perf_record.h"
+#include "xt/thread_clock.h"
 #include "xt/wgpu/wgpu_renderer.h"
 
 namespace probe_timing {
@@ -44,66 +46,14 @@ inline const char* phaseCsvName(int p) {
     return names[p];
 }
 
-/// The calling thread's CPU time in milliseconds. Windows: QueryThreadCycleTime with cycles per ms
-/// calibrated against steady_clock by a busy loop of at least 200 ms; elsewhere
-/// CLOCK_THREAD_CPUTIME_ID.
-class ThreadClock {
-public:
-    void calibrate() {
-#if defined(_WIN32)
-        // Eight 25 ms windows (200 ms in all); the highest rate wins: a window in which the thread
-        // was preempted counts fewer cycles per wall millisecond and would overstate every CPU time.
-        using Clock = std::chrono::steady_clock;
-        volatile uint64_t sink = 0;
-        double best = 0, total = 0;
-        for (int w = 0; w < 8; ++w) {
-            const ULONG64 c0 = cycles();
-            const auto t0 = Clock::now();
-            double ms = 0;
-            while (ms < 25.0) {
-                for (int i = 0; i < 10000; ++i) sink = sink + uint64_t(i);
-                ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
-            }
-            best = std::max(best, double(cycles() - c0) / ms);
-            total += ms;
-        }
-        m_cyclesPerMs = best;
-        m_calibrationMs = total;
-#endif
-    }
-    double nowMs() const {
-#if defined(_WIN32)
-        return m_cyclesPerMs > 0 ? double(cycles()) / m_cyclesPerMs : 0.0;
-#else
-        timespec ts{};
-        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
-        return double(ts.tv_sec) * 1000.0 + double(ts.tv_nsec) / 1.0e6;
-#endif
-    }
-    std::string describe() const {
-        char buf[160];
-#if defined(_WIN32)
-        std::snprintf(
-            buf, sizeof(buf),
-            "thread CPU = QueryThreadCycleTime / %.1f cycles per us (best of 8 windows, %.0f ms busy loop)",
-            m_cyclesPerMs / 1000.0, m_calibrationMs);
-#else
-        std::snprintf(buf, sizeof(buf), "thread CPU = CLOCK_THREAD_CPUTIME_ID");
-#endif
-        return buf;
-    }
-
-private:
-#if defined(_WIN32)
-    static ULONG64 cycles() {
-        ULONG64 c = 0;
-        QueryThreadCycleTime(GetCurrentThread(), &c);
-        return c;
-    }
-    double m_cyclesPerMs = 0;
-    double m_calibrationMs = 0;
-#endif
-};
+/// T-750: the thread clock lives in the core now (xt/thread_clock.h); the tracker's own clock is used
+/// (PerfTracker::setThreadCpuTiming / threadClock), so the meters below and FrameRecord read one clock.
+using ThreadClock = xt::ThreadClock;
+inline std::string describeClock(const ThreadClock& clock) {
+    char buf[160];
+    clock.describe(buf, sizeof(buf));
+    return buf;
+}
 
 /// The process's CPU time (user + kernel, every thread) and the main thread's (GetThreadTimes, coarse),
 /// in milliseconds; false where not measured (non-Windows).
@@ -241,28 +191,85 @@ inline void printTiming(const std::vector<FrameTiming>& frames, int warmup, cons
     }
 }
 
-/// `--timing-csv`: one row per frame (every frame; `steady` = 1 after the warm-up).
-inline bool writeCsv(const std::string& path, const std::vector<FrameTiming>& frames, int warmup) {
+/// T-750: how the meters above agree with FrameRecord (57 §57.2) over the steady frames: each meter
+/// phase against the record's phases it spans, and the record's closed budget.
+inline void printRecordAgreement(const std::vector<FrameTiming>& frames,
+                                 const std::vector<xt::FrameRecord>& records, int warmup, bool finish) {
+    const size_t first = std::min(frames.size(), size_t(std::max(warmup, 0)));
+    const size_t last = std::min(frames.size(), records.size());
+    if (last <= first) return;
+    std::vector<double> unaccounted;
+    double mUpdate = 0, rUpdate = 0, mPaint = 0, rPaint = 0, mWait = 0, rWait = 0, mRender = 0, rRender = 0,
+           mFrame = 0, rFrame = 0;
+    for (size_t i = first; i < last; ++i) {
+        const FrameTiming& t = frames[i];
+        const xt::FrameRecord& r = records[i];
+        mUpdate += t.wall[kUpdate];
+        rUpdate += double(r.inputMs) + r.updateMs + r.flowMs;
+        mPaint += t.wall[kPaint];
+        rPaint += double(r.paintMs) + r.damageMs;
+        mWait += t.wall[kInflightWait] + (finish ? t.wall[kQueueWait] : 0.0);
+        rWait += r.waitMs;
+        mRender += t.wall[kRender];
+        rRender += double(r.buildMs) + r.submitMs;
+        double sum = 0;
+        for (int p = 0; p < kPhaseCount; ++p) {
+            if (p == kQueueWait && !finish) continue;
+            sum += t.wall[p];
+        }
+        mFrame += sum;
+        rFrame += r.frameWallMs;
+        unaccounted.push_back(r.unaccountedMs);
+    }
+    const double d = double(last - first);
+    const Dist du = distOf(unaccounted);
+    std::printf("frame record (T-750, %zu steady frames; meter vs record, wall ms avg):\n", last - first);
+    std::printf("  update  %8.3f vs input + update + flow %8.3f\n", mUpdate / d, rUpdate / d);
+    std::printf("  paint   %8.3f vs paint + damage        %8.3f\n", mPaint / d, rPaint / d);
+    std::printf("  waits   %8.3f vs wait                  %8.3f\n", mWait / d, rWait / d);
+    std::printf("  render  %8.3f vs build + submit        %8.3f\n", mRender / d, rRender / d);
+    std::printf("  frame   %8.3f (sum of meters) vs frame_wall %8.3f\n", mFrame / d, rFrame / d);
+    std::printf("  unaccounted avg %.3f p99 %.3f ms (%.1f%% of the frame)\n", du.avg, du.p99,
+                rFrame > 0 ? 100.0 * du.avg / (rFrame / d) : 0.0);
+}
+
+/// `--timing-csv` (T-750): one row per frame -- FrameRecord v1 through the runtime's column table
+/// (`steady` = 1 after the warm-up), then the probe's own meters and GPU timestamps as `host.*` columns.
+inline bool writeCsv(const std::string& path, const std::vector<FrameTiming>& frames,
+                     const std::vector<xt::FrameRecord>& records, int warmup) {
     std::ofstream out(xt::compile::pathFromUtf8(path), std::ios::binary);
     if (!out) return false;
-    char buf[96];
-    out << "frame,steady";
-    for (int p = 0; p < kPhaseCount; ++p)
-        out << ',' << phaseCsvName(p) << "_wall_ms," << phaseCsvName(p) << "_cpu_ms";
-    out << ",gpu_span_ms,gpu_pass_sum_ms,gpu_passes\n";
-    for (size_t i = 0; i < frames.size(); ++i) {
+    std::vector<char> line(16384);
+    auto name = [](int p, const char* unit) { return std::string("host.") + phaseCsvName(p) + unit; };
+    size_t n = xt::frameRecordCsvHeader(line.data(), line.size());
+    for (int p = 0; p < kPhaseCount; ++p) {
+        n = xt::csvAppendText(line.data(), line.size(), n, name(p, "_wall_ms").c_str());
+        n = xt::csvAppendText(line.data(), line.size(), n, name(p, "_cpu_ms").c_str());
+    }
+    n = xt::csvAppendText(line.data(), line.size(), n, "host.gpu_span_ms");
+    n = xt::csvAppendText(line.data(), line.size(), n, "host.gpu_pass_sum_ms");
+    n = xt::csvAppendText(line.data(), line.size(), n, "host.gpu_passes");
+    out.write(line.data(), std::streamsize(std::min(n, line.size() - 1)));
+    out << '\n';
+    const size_t count = std::min(frames.size(), records.size());
+    for (size_t i = 0; i < count; ++i) {
         const FrameTiming& t = frames[i];
-        out << i << ',' << (int(i) >= warmup ? 1 : 0);
+        xt::FrameRecord r = records[i];
+        r.steady = int(i) >= warmup ? 1u : 0u;
+        n = xt::frameRecordCsvRow(r, line.data(), line.size());
         for (int p = 0; p < kPhaseCount; ++p) {
-            std::snprintf(buf, sizeof(buf), ",%.4f,%.4f", t.wall[p], t.cpu[p]);
-            out << buf;
+            n = xt::csvAppendNumber(line.data(), line.size(), n, t.wall[p], 4);
+            n = xt::csvAppendNumber(line.data(), line.size(), n, t.cpu[p], 4);
         }
         if (t.hasGpu) {
-            std::snprintf(buf, sizeof(buf), ",%.4f,%.4f,%u\n", t.gpu.spanMs, t.gpu.passSumMs, t.gpu.passes);
-            out << buf;
+            n = xt::csvAppendNumber(line.data(), line.size(), n, t.gpu.spanMs, 4);
+            n = xt::csvAppendNumber(line.data(), line.size(), n, t.gpu.passSumMs, 4);
+            n = xt::csvAppendNumber(line.data(), line.size(), n, double(t.gpu.passes), 0);
         } else {
-            out << ",,,\n";
+            for (int k = 0; k < 3; ++k) n = xt::csvAppendText(line.data(), line.size(), n, "");
         }
+        out.write(line.data(), std::streamsize(std::min(n, line.size() - 1)));
+        out << '\n';
     }
     out.close();
     return !out.fail();

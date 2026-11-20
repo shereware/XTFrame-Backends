@@ -115,6 +115,10 @@ public:
     bool supportsAlphaChannelReads() const override { return true; }
     /// T-729 (§10.18 B): kFxBackdropMaskedFrag takes the content as its third input (unit 2).
     bool supportsBackdropMask() const override { return true; }
+    /// T-764: kFxBackdropMaskedFrag samples R' and S from cached textures (BackdropParams' trailing fields).
+    bool supportsBackdropMaskTextures() const override { return true; }
+    /// T-806 (Docs/design/23-host-integration.md §23.aj): kTexturePlanarFrag draws Shading::TexturePlanar.
+    bool supportsPlanarExternal() const override { return true; }
     /// T-263d: GL_MAX_TEXTURE_SIZE as init() read it (0 before init or when the driver gave none).
     uint32_t maxTextureSize() const override {
         return m_maxTextureSize > 0 ? static_cast<uint32_t>(m_maxTextureSize) : 0;
@@ -162,6 +166,8 @@ private:
         GLint uShape1 = -1, uRadii1 = -1, uShape2 = -1, uRadii2 = -1, uTerms = -1;
         // T-665: kTextureLodFrag's lod, last level and straight flag.
         GLint uLodParams = -1;
+        // T-806: kTexturePlanarFrag's PlanarParams block.
+        GLint uPlanar = -1;
         // T-719: the leaf programs' analytic clip block (XT_GL_ANALYTIC_CLIP_COMMON).
         GLint uClipCount = -1, uClip = -1;
         UniformShadow shadow;
@@ -174,6 +180,10 @@ private:
     Program m_boxShadow, m_boxShadowMulti;
     /// T-665: the trilinear image program (DrawCmd::mipLod) and the mip box step.
     Program m_textureLod, m_mipBox;
+    /// T-806: Shading::TexturePlanar (kTexturePlanarFrag; uPlanar = the 12 vec4 of PlanarParams) and its
+    /// draw (gl_planar.cpp; state already applied).
+    Program m_texturePlanar;
+    void drawPlanar(const gpu::DrawCmd& cmd);
     /// T-660b: one Solid / Gradient command with DrawCmd::coverage (state already applied).
     void drawCoverage(const gpu::DrawCmd& cmd);
     /// T-202: the instanced particle programs (kParticleVert) and their instance buffer.
@@ -320,6 +330,23 @@ private:
     void bindSampled(GLuint tex, gpu::Sampler sampler);
     /// T-263b E5: gives the host texture bindSampled() changed its own min/mag filter back.
     void restoreHostFilter();
+    /// T-764: a BackdropMasked texture input `tex` (a cached target) for `unit`. Read bilinearly (`sampler`
+    /// Sampler::LinearClamp) it gets GL_LINEAR -- set every time: a paste with PointClamp may have left
+    /// GL_NEAREST, and a cached target reused from the free list is tracked as GL_LINEAR whatever its
+    /// texture was left with; texelFetch (PointClamp) ignores the filter. DrawCmd::texture is not used.
+    GLuint cachedTextureInput(gpu::TextureHandle tex, int unit, float sampler) {
+        const GLuint name = static_cast<GLuint>(tex);
+        for (Texture& t : m_textures) {
+            if (t.name != name || sampler != static_cast<float>(gpu::Sampler::LinearClamp)) continue;
+            m_cache.bindTexture(unit, name);
+            m_cache.activeTexture(unit);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, static_cast<GLint>(GL_LINEAR));
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, static_cast<GLint>(GL_LINEAR));
+            t.filter = GL_LINEAR;
+            break;
+        }
+        return name;
+    }
     struct HostFilter {
         GLuint texture = 0;  ///< 0 = nothing to restore
         GLint minFilter = 0;

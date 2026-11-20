@@ -3,12 +3,16 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <string>
 #include <vector>
 
 #include "camera.h"  // Code/Runtime/core/src internal header: cssPerspectiveViewProj (Tests/gl/CMakeLists.txt adds Code/Runtime/core/src).
 #include "doctest.h"
+#include "flatten_3d_fixtures.h"
 #include "gl_loader.h"
 #include "golden_common.h"
+#include "nested_projection_fixtures.h"
 #include "xt/asset_resolver.h"
 #include "xt/command_list.h"
 #include "xt/gl/gl_renderer.h"
@@ -466,4 +470,69 @@ TEST_CASE("gl 3D: content after PopProjection matches SW") {
     std::vector<uint8_t> gl = renderGlTopDown(cl, kW, kH);
     golden::GoldenResult result = golden::compareRgba(gl.data(), sw.data(), kW, kH, 16, 0.03f);
     CHECK(result.pass);
+}
+
+// T-761 (19 §19.y.1): nested projections (Tests/common/nested_projection_fixtures.h). Before T-761
+// the inner levels were divided on the CPU and an image with the perspective in an inner level was
+// interpolated affinely per triangle.
+namespace {
+
+void checkNested(const CommandList& cl, const char* what) {
+    namespace nested = xt::test::nested;
+    nested::CheckerResolver resolver;
+    IrView view{};
+    const std::vector<uint8_t> sw = renderSw(cl, nested::kW, nested::kH, &resolver, &view);
+    const std::vector<uint8_t> gl = renderGlTopDown(cl, nested::kW, nested::kH, &resolver, &view);
+    const double mean = nested::meanChannelDiff(gl, sw);
+    const golden::GoldenResult r =
+        golden::compareRgba(gl.data(), sw.data(), nested::kW, nested::kH, 16, 0.03f);
+    const int interior = nested::interiorDiffs(gl, sw, 16);
+    std::printf("gl vs sw %s: mean %.3f, %u px differ > 16 (%d off the edges), max channel diff %u\n", what,
+                mean, r.diffPixels, interior, r.maxChannelDiff);
+    CHECK(countFilled(sw, nested::kW, nested::kH) > 1000);
+    CHECK(mean < 1.0);
+    CHECK(interior == 0);
+    CHECK(r.pass);
+}
+
+}  // namespace
+
+TEST_CASE("gl 3D: image under a flat outer projection and a tilted inner one matches SW (T-761)") {
+    checkNested(xt::test::nested::flatOuterTiltedInner(), "flat outer + tilted inner");
+}
+
+TEST_CASE("gl 3D: image under two tilted nested projections matches SW (T-761)") {
+    checkNested(xt::test::nested::bothLevelsTilted(), "both levels tilted");
+}
+
+TEST_CASE("gl 3D: image quad under three nested projections matches SW (T-761)") {
+    checkNested(xt::test::nested::threeLevels(), "three levels");
+}
+
+TEST_CASE("gl 3D: gradient fill under nested projections matches SW (T-761)") {
+    checkNested(xt::test::nested::nestedGradientFill(), "nested gradient fill");
+}
+
+TEST_CASE("gl 3D: image under a single tilted projection matches SW (T-761 reference)") {
+    checkNested(xt::test::nested::singleLevelTilt(), "single level");
+}
+
+// T-762 (19 §19.y.2): a grouping flat node inside a 3D space holds its 3D children
+// (Tests/common/flatten_3d_fixtures.h): the group composites once, its children in document order.
+TEST_CASE("gl 3D: grouping properties flatten 3D descendants, matching SW (T-762)") {
+    namespace fx = xt::test::flatten;
+    std::string error;
+    const CommandList cl = fx::paintFixture(error);
+    REQUIRE_MESSAGE(error.empty(), error);
+    const std::vector<uint8_t> sw = renderSw(cl, fx::kW, fx::kH);
+    const std::vector<uint8_t> gl = renderGlTopDown(cl, fx::kW, fx::kH);
+    const golden::GoldenResult r = golden::compareRgba(gl.data(), sw.data(), fx::kW, fx::kH, 16, 0.03f);
+    std::printf("gl vs sw flatten 3D: %u px differ > 16, max channel diff %u\n", r.diffPixels,
+                r.maxChannelDiff);
+    CHECK(r.pass);
+    CHECK(fx::near(fx::at(gl, 0, fx::kOverlap), 128, 128, 255));
+    CHECK(fx::near(fx::at(gl, 0, fx::kGreenOverRed), 0, 255, 0));
+    CHECK(fx::near(fx::at(gl, 1, fx::kShadowOnly), 0, 0, 0));
+    CHECK(fx::near(fx::at(gl, 2, fx::kBlueOnly), 119, 119, 255));
+    CHECK(fx::near(fx::at(gl, 3, fx::kBlueOnly), 0, 0, 0));
 }

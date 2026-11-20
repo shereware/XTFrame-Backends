@@ -108,6 +108,24 @@ inline bool matches(const std::vector<uint8_t>& gpu, const std::vector<uint8_t>&
     return r.pass;
 }
 
+/// T-733: a CPU adapter (lavapipe, WARP: WGPUAdapterType_CPU in the shared adapter's info) may
+/// differ by 1 in a channel where a hardware adapter is byte for byte (T-812: moved here from
+/// test_wgpu_backdrop_cache.cpp, shared with test_wgpu_planar.cpp). Printed once.
+inline bool cpuAdapter() {
+    static const bool cpu = [] {
+        WGPUAdapterInfo info = WGPU_ADAPTER_INFO_INIT;
+        const WGPUAdapter adapter = xt::wgpu::test::sharedInit().adapter;
+        bool isCpu = false;
+        if (adapter != nullptr && wgpuAdapterGetInfo(adapter, &info) == WGPUStatus_Success) {
+            isCpu = info.adapterType == WGPUAdapterType_CPU;
+            wgpuAdapterInfoFreeMembers(info);
+        }
+        std::printf("wgpu backdrop cache: %s adapter\n", isCpu ? "CPU" : "hardware");
+        return isCpu;
+    }();
+    return cpu;
+}
+
 inline const uint8_t* pixel(const std::vector<uint8_t>& rgba, int w, int x, int y) {
     return rgba.data() + (static_cast<size_t>(y) * static_cast<size_t>(w) + static_cast<size_t>(x)) * 4;
 }

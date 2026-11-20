@@ -37,6 +37,7 @@ const char* const kShaderFiles[kShaderCount] = {
     shaders::k_coverage_gradient,
     shaders::k_box_shadow,
     shaders::k_box_shadow_multi,  // T-683
+    shaders::k_texture_planar,    // T-806
     shaders::k_fx_gauss_scalar,
     shaders::k_fx_gauss_color,
     shaders::k_fx_dilate,
@@ -422,7 +423,7 @@ bool Pipelines::prewarm(WGPUTextureFormat format, uint32_t samples) {
     content.hasStencil = true;
     for (const ShaderId shader :
          {kShSolid, kShGradient, kShTexture, kShTextureStraight, kShTextureLod, kShGlyph, kShCoverageSolid,
-          kShCoverageGradient, kShBoxShadow, kShBoxShadowMulti}) {
+          kShCoverageGradient, kShBoxShadow, kShBoxShadowMulti, kShTexturePlanar}) {
         content.shader = shader;
         ok = get(content) != nullptr && ok;
     }

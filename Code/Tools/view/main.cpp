@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -20,11 +21,14 @@
                         // GL upload.
 #endif
 #include "../Common/console_utf8.h"
+#include "../Common/planar_pack.h"  // T-806: --bind-planar
 #include "../Common/print_version.h"
+#include "../Common/spec_safe_area.h"
 #include "../Common/standard_symbols_note.h"
 #include "view_events.h"
 #include "view_flow.h"
 #include "view_layers.h"
+#include "view_perf_zones.h"
 #include "view_renderer.h"
 #include "xt/animator.h"
 #include "xt/asset_resolver.h"
@@ -48,6 +52,7 @@
 #include "xt/input.h"
 #include "xt/ir.h"
 #include "xt/perf.h"
+#include "xt/perf_record.h"
 #include "xt/scene_instance.h"
 #include "xt/shell/app.h"
 #ifndef XT_GL_NO_TEXT
@@ -90,10 +95,13 @@
 ///                    [--msaa N] [--screenshot PATH] [--flow <file.xtflow>] [--headless] [--transparent]
 ///                    [--frames N]
 ///                    [--print-text <id>] [--perf] [--perf-csv <file>] [--show-damage] [--partial]
+///                    [--idle-skip]
 ///                    [--no-system-fonts] [--no-box-shadow]
 ///                    [--event "<frame> #<id>.<Port>[=<value>]"] [--pointer "<frame> <x> <y> [move|down|up]"]
 ///                    [--dump-flow-values] [--dump-every N] [--dump-commands]
-///                    [--bind-texture <name>=<file.png>]
+///                    [--bind-texture <name>=<file.png>] [--texture-version-every N]
+///                    [--bind-planar <name>=<file.png>[,yuv420|yuva420][,601|709][,limited|full]
+///                                   [,left|center|topleft]]
 ///                    [--fit native|stretch|contain|cover|center] [--play <timeline>]
 ///                    [--seek <seconds>] [--device W:H] [--safe F|T,R,B,L]
 ///                    [--platform desktop|console|handheld] [--input mouse|gamepad|touch]
@@ -178,6 +186,16 @@
 /// `<img src="engine://<name>">` samples it. Under --headless only the size is bound (layout is
 /// right; T-191: the PNG's pixels are bound for the software renderer too).
 ///
+/// T-806 (Docs/design/23-host-integration.md §23.aj): --bind-planar <name>=<file.png>[,options] binds the
+/// PNG as a planar host texture: Code/Tools/Common/planar_pack.h turns it into the Y'CbCr 4:2:0 planes of
+/// one R8 texture (Y on top, U and V side by side below, A below them for yuva420), uploaded like
+/// --bind-texture's (a GL texture in the shell's window; the renderer's device with --renderer gl / wgpu,
+/// --headless too -- which now uploads --bind-texture's PNG as well), and described with
+/// AssetResolver::setExternalTexturePlanes. Options, in any order: yuv420 (default) | yuva420, 709
+/// (default) | 601, limited (default) | full, left (default) | center | topleft; `premul` makes the colour
+/// planes of yuva420 premultiplied. The software renderer draws no planar texture: a run on it prints one
+/// line and binds only the size. --texture-version-every applies to these names too.
+///
 /// --event / --pointer (Docs/tasks/T-125.md) script interaction for a run that has no user: both
 /// are repeatable and both are applied just before the named frame's Context::update(), i.e. after
 /// every earlier frame's layout has settled, so an element's box is known.
@@ -239,6 +257,19 @@
 /// interactive mode the window title shows `fps | update a.b ms | render c.d ms`, refreshed every
 /// 0.5 s; in every mode (including --headless) a PerfSummary table is printed to stdout when the
 /// run ends. --perf-csv <file> additionally writes one CSV row per frame (it implies --perf).
+/// T-750 (Docs/design/57-measurement.md §57.2, §57.5): the CSV is FrameRecord v1 (the runtime's column
+/// table) followed by the viewer's host.* columns; every frame is marked (markFrameStart / markFrameEnd),
+/// and the --perf summary ends with an `unaccounted avg / p99` line (the closed budget's remainder).
+/// T-747 (Docs/design/57-measurement.md §57.3): both report `idlePaintMs` and the cause table (one
+/// count per DirtyCause, the four kinds summed; T-750: CSV columns `cause_<name>_<kind>`); --perf-detail N
+/// sets PerfTracker::setDetail(N) (N >= 1: the summary also lists the last frame's nodes per cause).
+/// T-753 (57 §57.2 item 3, §57.3 item 4): N >= 1 also counts the redundant work (the summary's
+/// `redundant*` / `repainted*` rows, the CSV's redundant_* / repainted_unchanged_* columns); N >= 2 also
+/// times the second-level zones -- the summary ends with their table under each phase, and --perf-csv
+/// <name>.csv also writes <name>.zones.csv (view_perf_zones.h). --perf-cpu (implies --perf) turns on
+/// PerfTracker::setThreadCpuTiming, so the *_cpu_ms columns are filled. In the headless SW path the
+/// buffer clear before each render (the whole buffer, or the dirty rectangles with --partial) is part of
+/// the `build` phase (renderMs).
 ///
 /// --show-damage (Docs/design/23-host-integration.md §23.2, Docs/tasks/T-98.md) asks
 /// Context::render() for this frame's dirty rectangles and outlines each one with a 1 px red
@@ -257,6 +288,20 @@
 /// so --perf / --perf-csv measure the partial-redraw cost instead of a full repaint per frame. A
 /// `full` frame (and frame 0) is cleared and drawn whole. It needs --headless and the default
 /// renderer; --show-damage is ignored with it (the outline would stay in the kept pixels).
+///
+/// --idle-skip (T-749, Docs/design/23-host-integration.md §23.ag item 6) does what a host that adopts
+/// Context::needsFrame() does: a frame whose Context (and --flow graph) needs no frame calls neither
+/// update() nor render() -- nor the flow ticks or the renderer -- after the scripted input of that frame
+/// was queued (input wakes it); the window keeps pumping its events. The time keeps running: the next
+/// update() gets the dt that takes the Context's clock to where a run that never skipped would have it
+/// (bit for bit), so the frames drawn are the same. --perf then prints `idle-skipped frames: N of M` and
+/// the summary covers the frames drawn. Off by default; it applies to --headless and --renderer runs (the
+/// default windowed run ignores it with a note). A windowed --screenshot run never skips its last frame.
+///
+/// --verify-static-skip (T-748, Docs/design/23-host-integration.md §23.ag item 4) turns on
+/// Context::setVerifyStaticSkip: a Document that would skip its paint is painted anyway and compared
+/// with its previous commands; --perf reports `paintSkipped` and `staticSkipMismatch` either way
+/// (CSV columns of the same names), and a run that found a mismatch prints the first one on stderr.
 ///
 /// --no-system-fonts (T-676) skips FtTextShaper::addSystemFonts() in both the headless and the
 /// windowed path, so text is shaped only with the bundle's own fonts -- the same as a C ABI host
@@ -402,6 +447,13 @@ struct Args {
     std::vector<ScriptedEvent> events;      // --event, in the order given.
     std::vector<ScriptedPointer> pointers;  // --pointer, in the order given.
     std::vector<std::pair<std::string, std::string>> bindTextures;  // --bind-texture name=png (T-150).
+    /// T-806: --bind-planar name=png[,options] -- the name, the PNG and the plane description's fields.
+    struct PlanarBinding {
+        std::string name, file;
+        xt::AssetResolver::ExternalPlanes planes;  ///< layout / matrix / range / siting / premultiplied only
+    };
+    std::vector<PlanarBinding> bindPlanar;
+    uint32_t textureVersionEvery = 0;  // --texture-version-every N (T-746); 0 = no content version.
     bool headless = false;
     // T-701 (33): --layers <dir>, --layers-view and the layers view's starting camera.
     std::string layersDir;
@@ -421,10 +473,14 @@ struct Args {
     int secondWidth = 0;        // T-384b: --second-size WxH (0 = the main window's size).
     int secondHeight = 0;
     bool perf = false;
+    int perfDetail = 0;    // T-747: --perf-detail N.
+    bool perfCpu = false;  // T-753: --perf-cpu.
     bool showDamage = false;
-    bool partial = false;        // T-642: --partial (headless SW redraws only the damage).
-    bool noSystemFonts = false;  // T-676: --no-system-fonts (bundle fonts only).
-    bool noBoxShadow = false;    // T-680: --no-box-shadow (Context::setBoxShadowCommands(false)).
+    bool partial = false;           // T-642: --partial (headless SW redraws only the damage).
+    bool verifyStaticSkip = false;  // T-748: --verify-static-skip.
+    bool idleSkip = false;          // T-749: --idle-skip.
+    bool noSystemFonts = false;     // T-676: --no-system-fonts (bundle fonts only).
+    bool noBoxShadow = false;       // T-680: --no-box-shadow (Context::setBoxShadowCommands(false)).
     bool dumpFlowValues = false;
     bool dumpCommands = false;  // T-202: print the last headless frame's CommandList.
     std::string dumpPorts;      // T-401: --dump-ports <file>: the main UI's port table as JSON.
@@ -504,6 +560,8 @@ bool parsePointerSpec(const std::string& spec, ScriptedPointer& out) {
     }
     return true;
 }
+
+bool parsePlanarBinding(const std::string& v, Args::PlanarBinding& out);  // T-806, defined below
 
 bool parseArgs(int argc, char** argv, Args& out) {
     // T-420: --version wins over every other argument, a malformed one included. T-426:
@@ -772,6 +830,27 @@ bool parseArgs(int argc, char** argv, Args& out) {
                 return false;
             }
             out.bindTextures.emplace_back(v.substr(0, eq), v.substr(eq + 1));
+        } else if (arg == "--bind-planar") {
+            std::string v;
+            if (!needValue("--bind-planar", v)) {
+                return false;
+            }
+            if (!parsePlanarBinding(v, out.bindPlanar.emplace_back())) {
+                return false;
+            }
+        } else if (arg == "--texture-version-every") {
+            std::string v;
+            if (!needValue("--texture-version-every", v)) {
+                return false;
+            }
+            uint32_t n = 0;
+            if (!parseFrame(v, n) || n == 0) {
+                std::fprintf(stderr,
+                             "xtframe-view: --texture-version-every: expected a frame count >= 1, got '%s'\n",
+                             v.c_str());
+                return false;
+            }
+            out.textureVersionEvery = n;
         } else if (arg == "--perf") {
             out.perf = true;
         } else if (arg == "--synth-pointer") {
@@ -790,6 +869,10 @@ bool parseArgs(int argc, char** argv, Args& out) {
             out.showDamage = true;
         } else if (arg == "--partial") {
             out.partial = true;
+        } else if (arg == "--verify-static-skip") {
+            out.verifyStaticSkip = true;  // T-748
+        } else if (arg == "--idle-skip") {
+            out.idleSkip = true;  // T-749
         } else if (arg == "--no-system-fonts") {
             out.noSystemFonts = true;
         } else if (arg == "--no-box-shadow") {
@@ -799,6 +882,16 @@ bool parseArgs(int argc, char** argv, Args& out) {
                 return false;
             }
             out.perf = true;  // --perf-csv implies --perf.
+        } else if (arg == "--perf-detail") {
+            std::string v;
+            if (!needValue("--perf-detail", v)) {
+                return false;
+            }
+            out.perfDetail = static_cast<int>(std::strtol(v.c_str(), nullptr, 10));
+            out.perf = true;  // T-747: implies --perf.
+        } else if (arg == "--perf-cpu") {
+            out.perfCpu = true;  // T-753
+            out.perf = true;
         } else if (arg == "--frames") {
             std::string v;
             if (!needValue("--frames", v)) {
@@ -946,6 +1039,8 @@ struct ScratchBundle {
         if (!dir.empty()) {
             std::error_code ec;
             fs::remove_all(dir, ec);
+            // T-805: and `<temp>/xtframe-view` once no other viewer's scratch Bundle is in it.
+            fs::remove(dir.parent_path(), ec);
         }
     }
 };
@@ -955,7 +1050,8 @@ ScratchBundle g_scratchBundle;
 /// Bundle `outDir` the way xtframe-browse does (no thumbnails, `--prune`, nothing written back into
 /// the project). An old `ui-project.json` / `bundle.xtproj` is upgraded in memory only; the atlas is off
 /// because this viewer's resolver does not know atlas cells. Prints the diagnostics; false (after its own
-/// stderr line) when the project cannot be read or no UI could be packed.
+/// stderr line) when the project cannot be read or no UI could be packed. T-714: images are never
+/// compressed here (PackOptions::compress "none").
 bool packProject(const std::string& dir, const std::string& outDir, const std::string& standardSymbolDir,
                  const std::string& standardFontDir, bool verbose) {
     std::string error;
@@ -973,6 +1069,9 @@ bool packProject(const std::string& dir, const std::string& outDir, const std::s
     options.thumbnails = false;
     options.prune = true;
     options.writeAssetsManifest = false;
+    // T-714 (22 §22.17.1 item 2): a development pack -- fast and lossless, whatever the project's
+    // publish.images.compress says (the publish entry points are xtframe-pack and the editor).
+    options.compress = "none";
     // T-498b: the preset group resolves `xt-standard:` links and is the implied token layer (the
     // group's tokens, fonts and textures), as in xtframe-pack -- but nothing is copied into the
     // project (T-263f).
@@ -1137,9 +1236,8 @@ bool resolveInput(Args& args) {
         // T-210 (25 §25.4.1 item 2): its spec.logicalHeight gives uiscale = output height / it.
         if (const xt::bundle::BundleSpec* spec = bundle.spec()) {
             if (!args.safeGiven) {
-                const float safe = args.device.platform == xt::DeviceKind::Console ? spec->safeAreaConsole
-                                                                                   : spec->safeAreaDefault;
-                args.device.safeArea = xt::Insets{safe, safe, safe, safe};
+                // T-754 (10 §10.20 rule 7): the rule xtframe-gpu-probe applies too.
+                args.device.safeArea = xt::tools::specSafeArea(*spec, args.device.platform);
             }
             args.logicalHeight = spec->logicalHeight;
             args.uiscaleRule = spec->uiscaleRule;      // T-241
@@ -1234,12 +1332,134 @@ bool resolveInput(Args& args) {
     return true;
 }
 
+/// T-806: `v` of `--bind-planar <name>=<file.png>[,option...]` into `out`; false after a stderr line.
+bool parsePlanarBinding(const std::string& v, Args::PlanarBinding& out) {
+    using P = xt::AssetResolver;
+    const size_t eq = v.find('=');
+    const size_t comma = v.find(',', eq == std::string::npos ? 0 : eq);
+    if (eq == std::string::npos || eq == 0 || eq + 1 >= v.size() || comma == eq + 1) {
+        std::fprintf(stderr,
+                     "xtframe-view: --bind-planar: expected \"<name>=<file.png>[,options]\", got '%s'\n",
+                     v.c_str());
+        return false;
+    }
+    out.name = v.substr(0, eq);
+    out.file = v.substr(eq + 1, comma == std::string::npos ? std::string::npos : comma - eq - 1);
+    out.planes.layout = P::ExternalLayout::PackedYuv420;
+    size_t at = comma;
+    while (at != std::string::npos) {
+        const size_t next = v.find(',', at + 1);
+        const std::string opt =
+            v.substr(at + 1, next == std::string::npos ? std::string::npos : next - at - 1);
+        if (opt == "yuv420") {
+            out.planes.layout = P::ExternalLayout::PackedYuv420;
+        } else if (opt == "yuva420") {
+            out.planes.layout = P::ExternalLayout::PackedYuva420;
+        } else if (opt == "601") {
+            out.planes.matrix = P::ExternalMatrix::Bt601;
+        } else if (opt == "709") {
+            out.planes.matrix = P::ExternalMatrix::Bt709;
+        } else if (opt == "limited") {
+            out.planes.range = P::ExternalRange::Limited;
+        } else if (opt == "full") {
+            out.planes.range = P::ExternalRange::Full;
+        } else if (opt == "left") {
+            out.planes.siting = P::ChromaSiting::Left;
+        } else if (opt == "center") {
+            out.planes.siting = P::ChromaSiting::Center;
+        } else if (opt == "topleft") {
+            out.planes.siting = P::ChromaSiting::TopLeft;
+        } else if (opt == "premul") {
+            out.planes.premultipliedPlanes = true;
+        } else {
+            std::fprintf(
+                stderr,
+                "xtframe-view: --bind-planar: unknown option '%s' (yuv420 yuva420 601 709 limited full "
+                "left center topleft premul)\n",
+                opt.c_str());
+            return false;
+        }
+        at = next;
+    }
+    return true;
+}
+
+/// T-806: a GL texture of `data` (R8 when `r8`, else RGBA8), made the way an engine makes its own
+/// (linear, clamped); the shell's window path, where a GL context is current.
+#ifndef XT_SHELL_SW
+uint32_t uploadGlTexture(int w, int h, bool r8, const void* data) {
+    xt::gl::GLuint tex = 0;
+    xt::gl::glGenTextures(1, &tex);
+    xt::gl::glBindTexture(xt::gl::GL_TEXTURE_2D, tex);
+    xt::gl::glTexParameteri(xt::gl::GL_TEXTURE_2D, xt::gl::GL_TEXTURE_MIN_FILTER,
+                            static_cast<xt::gl::GLint>(xt::gl::GL_LINEAR));
+    xt::gl::glTexParameteri(xt::gl::GL_TEXTURE_2D, xt::gl::GL_TEXTURE_MAG_FILTER,
+                            static_cast<xt::gl::GLint>(xt::gl::GL_LINEAR));
+    xt::gl::glTexParameteri(xt::gl::GL_TEXTURE_2D, xt::gl::GL_TEXTURE_WRAP_S,
+                            static_cast<xt::gl::GLint>(xt::gl::GL_CLAMP_TO_EDGE));
+    xt::gl::glTexParameteri(xt::gl::GL_TEXTURE_2D, xt::gl::GL_TEXTURE_WRAP_T,
+                            static_cast<xt::gl::GLint>(xt::gl::GL_CLAMP_TO_EDGE));
+    xt::gl::glPixelStorei(xt::gl::GL_UNPACK_ALIGNMENT, 1);
+    xt::gl::glTexImage2D(xt::gl::GL_TEXTURE_2D, 0,
+                         static_cast<xt::gl::GLint>(r8 ? xt::gl::GL_R8 : xt::gl::GL_RGBA8), w, h, 0,
+                         r8 ? xt::gl::GL_RED : xt::gl::GL_RGBA, xt::gl::GL_UNSIGNED_BYTE, data);
+    xt::gl::glPixelStorei(xt::gl::GL_UNPACK_ALIGNMENT, 4);
+    return tex;
+}
+#endif
+
+/// T-806: binds every --bind-planar PNG (see the file comment). `upload` as bindExternalTextures';
+/// `target` (may be null) is the --renderer frame target whose device takes the texture.
+bool bindPlanarTextures(const Args& args, xt::AssetResolver& assets, bool upload,
+                        xt::view::FrameTarget* target) {
+    for (const Args::PlanarBinding& b : args.bindPlanar) {
+        std::vector<uint8_t> rgba;
+        int width = 0, height = 0;
+        if (!xt::sw::readPng(b.file, rgba, width, height) || width <= 0 || height <= 0) {
+            std::fprintf(stderr, "xtframe-view: --bind-planar: failed to read '%s'\n", b.file.c_str());
+            return false;
+        }
+        const xt::tools::PackedPlanes packed =
+            xt::tools::packPlanes(rgba.data(), width, height, b.planes.layout, b.planes.matrix,
+                                  b.planes.range, b.planes.siting, b.planes.premultipliedPlanes);
+        const int tw = packed.planes.textureWidth, th = packed.planes.textureHeight;
+        uint32_t texture = 0;
+        if (target != nullptr) {
+            texture = target->createHostTexture(tw, th, /*r8=*/true, packed.texels.data());
+        }
+#ifndef XT_SHELL_SW
+        if (texture == 0 && upload) {
+            texture = uploadGlTexture(tw, th, /*r8=*/true, packed.texels.data());
+        }
+#else
+        (void)upload;
+#endif
+        assets.setExternalTexture(b.name, texture, width, height);
+        if (args.textureVersionEvery > 0) {
+            assets.setExternalTextureVersion(b.name, 1);
+        }
+        if (texture == 0) {
+            std::printf(
+                "xtframe-view: --bind-planar: the software renderer draws no planar texture; "
+                "engine://%s is bound with its size only\n",
+                b.name.c_str());
+            continue;
+        }
+        assets.setExternalTexturePlanes(b.name, packed.planes);
+        std::printf("xtframe-view: bound engine://%s = '%s' (%dx%d, planes %dx%d R8)\n", b.name.c_str(),
+                    b.file.c_str(), width, height, tw, th);
+    }
+    return true;
+}
+
 /// T-150: binds every --bind-texture PNG on `assets` as `engine://<name>`. With `upload`
 /// (windowed mode, a GL context is current) the pixels become a GL texture the renderer never
 /// created, exactly like an engine-owned one; without it (headless) the pixels are bound for the
 /// software renderer instead (AssetResolver::setExternalPixels, T-191).
+/// T-806: with a --renderer frame `target`, the PNG becomes a texture of the renderer's device instead.
 /// Returns false (after its own stderr line) when a PNG cannot be read.
-bool bindExternalTextures(const Args& args, xt::AssetResolver& assets, bool upload) {
+bool bindExternalTextures(const Args& args, xt::AssetResolver& assets, bool upload,
+                          xt::view::FrameTarget* target = nullptr) {
     for (const auto& [name, file] : args.bindTextures) {
         std::vector<uint8_t> rgba;
         int width = 0;
@@ -1249,31 +1469,27 @@ bool bindExternalTextures(const Args& args, xt::AssetResolver& assets, bool uplo
             return false;
         }
         uint32_t texture = 0;
+        if (target != nullptr) {  // T-806: the --renderer device's texture
+            texture = target->createHostTexture(width, height, /*r8=*/false, rgba.data());
+            upload = upload || texture != 0;
+        }
 #ifdef XT_SHELL_SW
-        upload = false;  // T-240: the SW presentation path has no GL context; CPU pixels instead.
+        upload =
+            upload && texture != 0;  // T-240: the SW presentation path has no GL context; CPU pixels instead.
 #else
-        if (upload) {
-            xt::gl::GLuint tex = 0;
-            xt::gl::glGenTextures(1, &tex);
-            xt::gl::glBindTexture(xt::gl::GL_TEXTURE_2D, tex);
-            xt::gl::glTexParameteri(xt::gl::GL_TEXTURE_2D, xt::gl::GL_TEXTURE_MIN_FILTER,
-                                    static_cast<xt::gl::GLint>(xt::gl::GL_LINEAR));
-            xt::gl::glTexParameteri(xt::gl::GL_TEXTURE_2D, xt::gl::GL_TEXTURE_MAG_FILTER,
-                                    static_cast<xt::gl::GLint>(xt::gl::GL_LINEAR));
-            xt::gl::glTexParameteri(xt::gl::GL_TEXTURE_2D, xt::gl::GL_TEXTURE_WRAP_S,
-                                    static_cast<xt::gl::GLint>(xt::gl::GL_CLAMP_TO_EDGE));
-            xt::gl::glTexParameteri(xt::gl::GL_TEXTURE_2D, xt::gl::GL_TEXTURE_WRAP_T,
-                                    static_cast<xt::gl::GLint>(xt::gl::GL_CLAMP_TO_EDGE));
-            xt::gl::glPixelStorei(xt::gl::GL_UNPACK_ALIGNMENT, 1);
-            xt::gl::glTexImage2D(xt::gl::GL_TEXTURE_2D, 0, static_cast<xt::gl::GLint>(xt::gl::GL_RGBA8),
-                                 width, height, 0, xt::gl::GL_RGBA, xt::gl::GL_UNSIGNED_BYTE, rgba.data());
-            xt::gl::glPixelStorei(xt::gl::GL_UNPACK_ALIGNMENT, 4);
-            texture = tex;
+        if (upload && texture == 0) {
+            texture = uploadGlTexture(width, height, /*r8=*/false, rgba.data());
         }
 #endif
         // The PNG's pixels are straight alpha: the flag makes the GL backend premultiply while
         // sampling (Shading::TextureStraight), which is also the path an engine texture takes.
         assets.setExternalTexture(name, texture, width, height, /*straightAlpha=*/true);
+        if (args.textureVersionEvery > 0) {
+            assets.setExternalTextureVersion(name, 1);  // T-746: see raiseTextureVersions()
+        }
+        if (upload && texture == 0) {
+            std::fprintf(stderr, "xtframe-view: --bind-texture: no texture for '%s'\n", file.c_str());
+        }
         if (!upload) {
             // T-191: the software renderer draws a binding's CPU pixels; they live until exit.
             static std::deque<xt::ImageData> cpuPixels;
@@ -1287,6 +1503,22 @@ bool bindExternalTextures(const Args& args, xt::AssetResolver& assets, bool uplo
                     height, upload ? "" : ", CPU pixels");
     }
     return true;
+}
+
+/// T-746 (Docs/design/23-host-integration.md §23.ah): --texture-version-every N gives every
+/// --bind-texture name a content version (1 when bound) and raises it before the update of frame N,
+/// 2N, ..., as a host whose source shows a new picture every N frames would (the PNG itself stays):
+/// the frames in between count the texture as still (skipped paints, cached effects over it).
+void raiseTextureVersions(const Args& args, xt::AssetResolver& assets, uint32_t frame) {
+    if (args.textureVersionEvery == 0 || frame == 0 || frame % args.textureVersionEvery != 0) {
+        return;
+    }
+    for (const auto& binding : args.bindTextures) {
+        assets.setExternalTextureVersion(binding.first, 1 + frame / args.textureVersionEvery);
+    }
+    for (const Args::PlanarBinding& binding : args.bindPlanar) {  // T-806
+        assets.setExternalTextureVersion(binding.name, 1 + frame / args.textureVersionEvery);
+    }
 }
 
 /// The usage block, on `out` (stdout for --help, stderr for an argument error).
@@ -1372,18 +1604,32 @@ void printUsage(std::FILE* out) {
         "                          diagnostics to FILE as the shared JSON list when the run ends\n"
         "  --log-ports             headless: print `port <kind> <name> = <value> (frame N)` for\n"
         "                          every port change / emit / list change of the main UI\n"
-        "  --perf                  frame tracing; --perf-csv <file> writes one row per frame\n"
+        "  --perf                  frame tracing; --perf-csv <file> writes one row per frame;\n"
+        "                          --perf-detail N also records the nodes per dirty cause and the\n"
+        "                          redundant work (N >= 1) and times the second-level zones (N >= 2);\n"
+        "                          --perf-cpu also records the thread CPU time of every phase\n"
         "  --synth-pointer N       measurement: N PointerMove events per frame along the diagonal\n"
         "  --synth-ports N         measurement: write the first N document-level number ports\n"
         "                          every frame (a different 0..100 triangle wave each)\n"
         "  --show-damage           outline the dirty rectangles (needs --headless)\n"
         "  --partial               headless: redraw only the dirty rectangles each frame (the\n"
         "                          DamageList goes to the software renderer, as a host does)\n"
+        "  --verify-static-skip    paint the Documents a static frame would skip anyway and\n"
+        "                          compare (reports the first mismatch on stderr)\n"
+        "  --idle-skip             skip update and render while Context::needsFrame() is false\n"
+        "                          (--headless / --renderer runs; --perf counts the skipped frames)\n"
         "  --no-system-fonts       do not add the system fonts (bundle fonts only, like a C ABI\n"
         "                          host without system_fonts)\n"
         "  --bind-texture <name>=<file.png>\n"
         "                          bind the PNG as the host texture `engine://<name>` (repeatable;\n"
         "                          --headless binds its CPU pixels)\n"
+        "  --bind-planar "
+        "<name>=<file.png>[,yuv420|yuva420][,601|709][,limited|full][,left|center|topleft][,premul]\n"
+        "                          bind the PNG as Y'CbCr 4:2:0 planes in one R8 host texture\n"
+        "                          (gl / wgpu; the software renderer draws none)\n"
+        "  --texture-version-every N\n"
+        "                          give the --bind-texture names a content version and raise it\n"
+        "                          every N frames (the frames between count them as unchanged)\n"
         "  --no-box-shadow         keep element drop shadows as offscreen effects (no\n"
         "                          DrawBoxShadow commands; for before/after comparisons)\n"
         "  --play <timeline>       play the document's root @timeline before the first frame\n"
@@ -1521,7 +1767,22 @@ struct GpuCounterTotals {
 /// agent can read it. Times are milliseconds; `render`/`effects`/`text` come from the backend and
 /// are CPU time (the GL backend never calls glFinish).
 /// `damageAreaPercent` < 0 means "damage was not computed this run", which hides that row.
-void printPerfSummary(const xt::PerfSummary& s, float damageAreaPercent = -1.0f) {
+/// T-749 (--idle-skip): the dt that takes a clock at `from` to exactly `to` in the one float addition
+/// Context::update() makes, so a run that skipped idle frames goes on with the clock values of a run that
+/// did not. `to` >= `from`.
+float dtReaching(float from, float to) {
+    float dt = to - from;
+    for (int i = 0; i < 8; ++i) {
+        const float reached = from + dt;
+        if (reached == to) {
+            break;
+        }
+        dt = std::nextafter(dt, reached < to ? INFINITY : -INFINITY);
+    }
+    return dt < 0.0f ? 0.0f : dt;
+}
+
+void printPerfSummary(const xt::PerfSummary& s, float damageAreaPercent = -1.0f, int detail = 0) {
     std::printf("xtframe-view: perf summary over %u frame(s), fps avg %.1f\n", s.frames, s.fpsAvg);
     if (s.frames == 0) {
         return;
@@ -1563,6 +1824,7 @@ void printPerfSummary(const xt::PerfSummary& s, float damageAreaPercent = -1.0f)
     row("  sw:fxDilate", s.avg.swFxDilateMs, s.max.swFxDilateMs);
     row("  sw:fxSdf", s.avg.swFxSdfMs, s.max.swFxSdfMs);
     row("  sw:fxPix", s.avg.swFxPixMs, s.max.swFxPixMs);
+    row("idlePaint", s.avg.idlePaintMs, s.max.idlePaintMs);  // T-747 (57 §57.3 item 4)
     if (damageAreaPercent >= 0.0f) {
         // T-98: the share of the viewport a host would have had to upload, averaged over the run.
         std::printf("  %-12s %10.1f %%\n", "damage area", static_cast<double>(damageAreaPercent));
@@ -1576,6 +1838,7 @@ void printPerfSummary(const xt::PerfSummary& s, float damageAreaPercent = -1.0f)
     count("animations", s.avg.activeAnimations, s.max.activeAnimations);
     count("transitions", s.avg.activeTransitions, s.max.activeTransitions);
     count("animEvaluated", s.avg.animEvaluated, s.max.animEvaluated);  // T-717
+    count("exprEvaluated", s.avg.exprEvaluated, s.max.exprEvaluated);  // T-776
     count("commands", s.avg.commands, s.max.commands);
     count("layers", s.avg.layers, s.max.layers);
     count("effectLayers", s.avg.effectLayers, s.max.effectLayers);
@@ -1598,6 +1861,25 @@ void printPerfSummary(const xt::PerfSummary& s, float damageAreaPercent = -1.0f)
     count("backdropCopyPx", s.avg.backdropCopyPx, s.max.backdropCopyPx);
     count("pyramidLevels", s.avg.pyramidLevels, s.max.pyramidLevels);
     count("directFallback", s.avg.directFallback, s.max.directFallback);
+    // T-747 (57 §57.3 item 2): the cause table, the four kinds summed per cause.
+    for (uint32_t c = 0; c < xt::kDirtyCauseCount; ++c) {
+        const auto cause = static_cast<xt::DirtyCause>(c);
+        const std::string name = std::string("cause:") + xt::dirtyCauseName(cause);
+        count(name.c_str(), xt::causeTotal(s.avg, cause), xt::causeTotal(s.max, cause));
+    }
+    // T-747: --perf-detail >= 1 -- the last frame's most recent nodes per cause.
+    for (uint32_t c = 0; c < xt::kDirtyCauseCount; ++c) {
+        if (s.avg.causeNodes[c][0] == xt::kInvalidNode) {
+            continue;
+        }
+        std::printf("  nodes:%s", xt::dirtyCauseName(static_cast<xt::DirtyCause>(c)));
+        for (uint32_t id : s.avg.causeNodes[c]) {
+            if (id != xt::kInvalidNode) {
+                std::printf(" %u", id);
+            }
+        }
+        std::printf("\n");
+    }
     count("setStyle", s.avg.setStyleCalls, s.max.setStyleCalls);  // T-389
     count("flowSignals", s.avg.flowSignals, s.max.flowSignals);   // T-475
     count("flowCoalesced", s.avg.flowSignalsCoalesced, s.max.flowSignalsCoalesced);
@@ -1607,6 +1889,26 @@ void printPerfSummary(const xt::PerfSummary& s, float damageAreaPercent = -1.0f)
     count("flowSinkTyped", s.avg.flowSinkTyped, s.max.flowSinkTyped);  // T-477
     count("flowSinkText", s.avg.flowSinkText, s.max.flowSinkText);
     count("flowAllocs", s.avg.flowAllocs, s.max.flowAllocs);
+    count("dashHits", s.avg.borderDashHits, s.max.borderDashHits);  // T-737
+    count("dashMisses", s.avg.borderDashMisses, s.max.borderDashMisses);
+    count("dashEntries", s.avg.borderDashEntries, s.max.borderDashEntries);
+    count("dashBytes", s.avg.borderDashBytes, s.max.borderDashBytes);
+    count("culledOffscreen", s.avg.culledOffscreen, s.max.culledOffscreen);     // T-754
+    count("paintSkipped", s.avg.paintSkipped, s.max.paintSkipped);              // T-748
+    count("skipMismatch", s.avg.staticSkipMismatch, s.max.staticSkipMismatch);  // T-748
+    count("layoutRoots", s.avg.layoutRoots, s.max.layoutRoots);                 // T-755
+    count("layoutFull", s.avg.layoutFullPasses, s.max.layoutFullPasses);
+    count("layoutMismatch", s.avg.partialLayoutMismatch, s.max.partialLayoutMismatch);
+    if (detail >= 1) {
+        // T-753 (57 §57.3 item 4): work that changed nothing.
+        count("redundantStyled", s.avg.redundantStyled, s.max.redundantStyled);
+        count("redundantLaidOut", s.avg.redundantLaidOut, s.max.redundantLaidOut);
+        count("redundantCmds", s.avg.redundantCommands, s.max.redundantCommands);
+        count("repaintedNoCache", s.avg.repaintedUnchangedNotCacheable, s.max.repaintedUnchangedNotCacheable);
+        count("repaintedKey", s.avg.repaintedUnchangedKeyChanged, s.max.repaintedUnchangedKeyChanged);
+        count("repaintedBudget", s.avg.repaintedUnchangedBudget, s.max.repaintedUnchangedBudget);
+        count("repaintedFirst", s.avg.repaintedUnchangedFirstSight, s.max.repaintedUnchangedFirstSight);
+    }
 }
 
 /// T-343: `--scene` strips the editor-only subtree (the reference frame under a HUD) so the
@@ -1660,21 +1962,27 @@ bool loadScene(const std::string& file, std::vector<uint8_t>& rgba, int& width, 
     return true;
 }
 
-/// `--perf-csv`: one row per frame, written as the frames are recorded so a run longer than the
-/// tracker's 240-frame history still produces every row.
+/// `--perf-csv` (T-750, Docs/design/57-measurement.md §57.5 item 4): one row per frame -- FrameRecord v1
+/// through the runtime's column table (`steady` = frames from --warmup on), then the viewer's own
+/// `host.*` columns (the backend call, the SW backend's breakdown and the flow stages and counters,
+/// which the record leaves to the second layer) -- written as the frames are recorded so a run longer than
+/// the tracker's 240-frame history still produces every row.
 class PerfCsvWriter {
 public:
     /// Opens `path` and writes the header; ok() is false when the file could not be opened.
-    explicit PerfCsvWriter(const std::string& path) : m_out(pathFromUtf8(path), std::ios::binary) {
+    PerfCsvWriter(const std::string& path, uint32_t warmup)
+        : m_out(pathFromUtf8(path), std::ios::binary), m_warmup(warmup), m_line(16384) {
         if (!m_out) {
             return;
         }
-        m_out << "frameIndex";
-#define XT_VIEW_CSV_HEAD(name) m_out << "," << #name;
-        XT_FRAME_STATS_FLOAT_FIELDS(XT_VIEW_CSV_HEAD)
-        XT_FRAME_STATS_UINT_FIELDS(XT_VIEW_CSV_HEAD)
-#undef XT_VIEW_CSV_HEAD
-        m_out << "\n";
+        size_t n = xt::frameRecordCsvHeader(m_line.data(), m_line.size());
+        for (const HostColumn& c : kHostColumns) {
+            n = xt::csvAppendText(m_line.data(), m_line.size(), n, c.name);
+        }
+        for (const HostCount& c : kHostCounts) {
+            n = xt::csvAppendText(m_line.data(), m_line.size(), n, c.name);
+        }
+        writeLine(n);
     }
     /// True when the file is open and rows are being written.
     bool ok() const { return static_cast<bool>(m_out); }
@@ -1687,24 +1995,100 @@ public:
             if (f.frameIndex < m_written) {
                 continue;
             }
-            char buffer[32];
-            m_out << f.frameIndex;
-#define XT_VIEW_CSV_FLOAT(name)                                                 \
-    std::snprintf(buffer, sizeof(buffer), "%.4f", static_cast<double>(f.name)); \
-    m_out << "," << buffer;
-            XT_FRAME_STATS_FLOAT_FIELDS(XT_VIEW_CSV_FLOAT)
-#undef XT_VIEW_CSV_FLOAT
-#define XT_VIEW_CSV_UINT(name) m_out << "," << f.name;
-            XT_FRAME_STATS_UINT_FIELDS(XT_VIEW_CSV_UINT)
-#undef XT_VIEW_CSV_UINT
-            m_out << "\n";
+            xt::FrameRecord record = xt::makeFrameRecord(f);
+            record.steady = f.frameIndex >= m_warmup ? 1u : 0u;
+            size_t n = xt::frameRecordCsvRow(record, m_line.data(), m_line.size());
+            for (const HostColumn& c : kHostColumns) {
+                n = xt::csvAppendNumber(m_line.data(), m_line.size(), n, static_cast<double>(f.*(c.field)),
+                                        4);
+            }
+            for (const HostCount& c : kHostCounts) {
+                n = xt::csvAppendNumber(m_line.data(), m_line.size(), n, static_cast<double>(f.*(c.field)),
+                                        0);
+            }
+            writeLine(n);
             m_written = f.frameIndex + 1;
         }
     }
 
 private:
+    struct HostColumn {
+        const char* name;
+        float xt::FrameStats::* field;
+    };
+    static constexpr HostColumn kHostColumns[] = {
+        {"host.render_ms", &xt::FrameStats::renderMs},
+        {"host.effects_ms", &xt::FrameStats::effectsMs},
+        {"host.text_ms", &xt::FrameStats::textMs},
+        {"host.sw_path_ms", &xt::FrameStats::swPathMs},
+        {"host.sw_raster_ms", &xt::FrameStats::swRasterMs},
+        {"host.sw_span_ms", &xt::FrameStats::swSpanMs},
+        {"host.sw_span_image_ms", &xt::FrameStats::swSpanImageMs},
+        {"host.sw_clip_ms", &xt::FrameStats::swClipMs},
+        {"host.sw_layer_ms", &xt::FrameStats::swLayerMs},
+        {"host.sw_fx_blur_ms", &xt::FrameStats::swFxBlurMs},
+        {"host.sw_fx_dilate_ms", &xt::FrameStats::swFxDilateMs},
+        {"host.sw_fx_sdf_ms", &xt::FrameStats::swFxSdfMs},
+        {"host.sw_fx_pix_ms", &xt::FrameStats::swFxPixMs},
+        {"host.flow_deliver_ms", &xt::FrameStats::flowDeliverMs},
+        {"host.flow_eval_ms", &xt::FrameStats::flowEvalMs},
+        {"host.flow_sink_ms", &xt::FrameStats::flowSinkMs},
+        {"host.flow_poll_ms", &xt::FrameStats::flowPollMs},
+    };
+    struct HostCount {
+        const char* name;
+        uint32_t xt::FrameStats::* field;
+    };
+    static constexpr HostCount kHostCounts[] = {
+        {"host.flow_signals_coalesced", &xt::FrameStats::flowSignalsCoalesced},
+        {"host.flow_fan_out_edges", &xt::FrameStats::flowFanOutEdges},
+        {"host.flow_sink_typed", &xt::FrameStats::flowSinkTyped},
+        {"host.flow_sink_text", &xt::FrameStats::flowSinkText},
+        {"host.flow_allocs", &xt::FrameStats::flowAllocs},
+    };
+    void writeLine(size_t n) {
+        m_out.write(m_line.data(), static_cast<std::streamsize>(std::min(n, m_line.size() - 1)));
+        m_out << "\n";
+    }
     std::ofstream m_out;
+    uint32_t m_warmup = 0;
+    std::vector<char> m_line;
     uint32_t m_written = 0;  // frameIndex of the next row to write.
+};
+
+/// T-750 (57 §57.2 item 2, 57 §57.8 item 1): FrameRecord::unaccountedMs of every marked frame, for the
+/// closing line of --perf.
+struct UnaccountedTotals {
+    std::vector<float> values;
+    double frameSum = 0;
+    /// Notes the current frame of `tracker` (after markFrameEnd()).
+    void note(const xt::PerfTracker& tracker) {
+        const xt::FrameStats& f = tracker.current();
+        if (!tracker.enabled() || f.frameMarked == 0) {
+            return;
+        }
+        values.push_back(xt::makeFrameRecord(f).unaccountedMs);
+        frameSum += f.frameWallMs;
+    }
+    void print() const {
+        if (values.empty()) {
+            std::printf("  unaccounted: no marked frames\n");
+            return;
+        }
+        std::vector<float> sorted = values;
+        std::sort(sorted.begin(), sorted.end());
+        double sum = 0;
+        for (float v : sorted) {
+            sum += v;
+        }
+        const double n = static_cast<double>(sorted.size());
+        const size_t k = static_cast<size_t>(std::ceil(0.99 * n));
+        const double p99 = sorted[std::min(sorted.size() - 1, k > 0 ? k - 1 : 0)];
+        const double frameAvg = frameSum / n;
+        std::printf(
+            "  unaccounted avg %.3f ms p99 %.3f ms (%.1f %% of the frame, avg %.3f ms over %zu frames)\n",
+            sum / n, p99, frameAvg > 0 ? 100.0 * (sum / n) / frameAvg : 0.0, frameAvg, sorted.size());
+    }
 };
 
 /// --show-damage: outlines every dirty rectangle with a 1 px red border in the software
@@ -1786,6 +2170,7 @@ bool loadInto(xt::Context& ctx, const std::string& path, const std::string& root
         options.searchDirs = searchDirs;
         options.stripEditorOnly = g_stripEditorOnly;  // T-343: --scene shows the published UI.
         options.strict = g_strict;                    // T-392
+        options.symbolsDir = xt::tools::projectSymbolsDirOf(inputPath);  // T-743 (T-741's open item)
         // T-56: `.xt` source (Docs/tasks/T-56.md's `xtframe-view --flow` CTest runs against
         // Examples/desktop_app/ui/app.xt directly, not a pre-compiled `.xtir`), compiled at
         // runtime the same way Examples/engine_integration/main.cpp does.
@@ -2472,6 +2857,9 @@ int main(int argc, char** argv) {
                                            ? xt::FileAssetResolver(rootDir, xt::sw::decodeImageBytes)
                                            : xt::FileAssetResolver(args.assetRoots, xt::sw::decodeImageBytes);
         assets.setFileStatusFn(&xt::fileStatusUtf8);  // T-263e: the same function the window path passes.
+        if (args.bundle) {
+            args.bundle->registerImageMeta(assets);  // T-759: atlas cells, slices, @2x / @3x variants.
+        }
         xt::Context ctx(xt::ContextConfig{&shaper, &assets});
         // T-191 (25.3.5b): no decoder here -- an unbound <video>/<external> shows its placeholder.
         ctx.setExternalPlaceholders(true);
@@ -2484,7 +2872,8 @@ int main(int argc, char** argv) {
                          "xtframe-view: layers view: drag with the right button to turn the "
                          "camera, wheel = depth scale\n");
         }
-        if (!bindExternalTextures(args, assets, /*upload=*/false)) {
+        if (!bindExternalTextures(args, assets, /*upload=*/false, frameTarget.get()) ||
+            !bindPlanarTextures(args, assets, /*upload=*/false, frameTarget.get())) {
             return 1;
         }
         if (!setupLanguage(args, rootDir, localization, ctx)) {
@@ -2559,13 +2948,28 @@ int main(int argc, char** argv) {
         auto systemEvent = [&targets](const ScriptedEvent& event) { postSystemEvent(targets, event); };
 
         ctx.perf().setEnabled(args.perf);
+        ctx.perf().setDetail(args.perfDetail);        // T-747
+        ctx.perf().setThreadCpuTiming(args.perfCpu);  // T-753
+        if (args.verifyStaticSkip) {
+            ctx.setVerifyStaticSkip(true);  // T-748
+        }
         std::unique_ptr<PerfCsvWriter> csv;
         if (!args.perfCsv.empty()) {
-            csv = std::make_unique<PerfCsvWriter>(args.perfCsv);
+            csv = std::make_unique<PerfCsvWriter>(args.perfCsv, args.warmup);
             if (!csv->ok()) {
                 std::fprintf(stderr, "xtframe-view: failed to open '%s' for writing\n", args.perfCsv.c_str());
                 return 1;
             }
+        }
+        // T-753: --perf-detail 2's zones (and <name>.zones.csv beside --perf-csv).
+        const bool zonesOn = args.perf && args.perfDetail >= 2;
+        xt::tools::view::ZoneFrames zoneFrames(
+            zonesOn && !args.perfCsv.empty() ? xt::tools::view::zonesCsvPath(args.perfCsv) : std::string(),
+            args.warmup);
+        if (!zoneFrames.ok()) {
+            std::fprintf(stderr, "xtframe-view: failed to open '%s' for writing\n",
+                         xt::tools::view::zonesCsvPath(args.perfCsv).c_str());
+            return 1;
         }
 
         xt::sw::SwRenderer renderer;
@@ -2624,7 +3028,13 @@ int main(int argc, char** argv) {
             frameCount = args.screenshot.empty() ? UINT32_MAX : args.warmup + 1;
         }
         double lastTime = windowLoop ? frameTarget->seconds() : 0.0;
-        GpuCounterTotals gpuTotals;  // T-658
+        GpuCounterTotals gpuTotals;     // T-658
+        UnaccountedTotals unaccounted;  // T-750
+        // T-749 (--idle-skip): the frames skipped, whether one was skipped since the last update(), and
+        // the clock a run that never skips would have (the dts added as Context::update() adds them).
+        uint32_t idleSkipped = 0;
+        bool skippedSinceUpdate = false;
+        float runClock = 0.0f;
         for (uint32_t frame = 0; frame < frameCount; ++frame) {
             float frameDt = frame == 0 ? 0.0f : dt;
             if (windowLoop) {
@@ -2643,14 +3053,33 @@ int main(int argc, char** argv) {
                 lastTime = now;
             }
             portLogFrame = frame;
-            // T-125: queued before update(), which drains and dispatches the queue first.
-            applyScriptedInput(args, ctx, handle, frame, systemEvent);
+            raiseTextureVersions(args, assets, frame);  // T-746: before the idle test (wakes the Context)
+            if (args.idleSkip) {
+                // T-749: this frame's scripted input first -- it wakes the Context.
+                applyScriptedInput(args, ctx, handle, frame, systemEvent);
+                runClock += frameDt;
+                const bool lastShot = windowLoop && !args.screenshot.empty() && frame + 1 == frameCount;
+                if (frame > 0 && !lastShot && !ctx.needsFrame() && !(hasFlow && flowRuntime.needsTick())) {
+                    ++idleSkipped;
+                    skippedSinceUpdate = true;
+                    continue;
+                }
+                if (skippedSinceUpdate) {
+                    frameDt = dtReaching(ctx.clock(), runClock);  // The time skipped, to the same clock.
+                    skippedSinceUpdate = false;
+                }
+                ctx.perf().markFrameStart();
+            } else {
+                ctx.perf().markFrameStart();  // T-750 (57 §57.2 item 2): the frame's work starts here
+                // T-125: queued before update(), which drains and dispatches the queue first.
+                applyScriptedInput(args, ctx, handle, frame, systemEvent);
+            }
             ctx.update(frameDt);
             if (frame == 0) {
                 reportMissingFonts(ctx.document(handle), shaper);  // T-569
             }
             if (hasFlow || targets.project.bundle) {
-                xt::PerfScope flowScope(ctx.perf(), &xt::FrameStats::flowMs);
+                xt::PerfPhaseScope flowScope(ctx.perf(), &xt::FrameStats::flowMs, &xt::FrameStats::flowCpuMs);
                 if (hasFlow) {
                     flowRuntime.tick(frameDt);
                 }
@@ -2701,15 +3130,31 @@ int main(int argc, char** argv) {
             } else {
                 renderer.setTarget(target);
                 const xt::Color clearColor = args.transparent ? xt::Color{0, 0, 0, 0} : xt::Color{1, 1, 1, 1};
-                if (partialRedraw && frame != 0 && !damage.full) {
-                    // T-642: as a host keeps its texture -- only the dirty rectangles are cleared
-                    // and redrawn; every other pixel still holds the previous frame.
-                    renderer.clearRects(clearColor, damage.rects);
+                // T-753 (57 §57.2 item 2): the clear is part of the frame's `build` phase. The full
+                // repaint below blends every command over the buffer, so the whole buffer must be
+                // cleared each frame; only --partial (which also draws only the damage) clears less.
+                const bool partialFrame = partialRedraw && frame != 0 && !damage.full;
+                {
+                    xt::PerfPhaseScope clearScope(ctx.perf(), &xt::FrameStats::renderMs,
+                                                  &xt::FrameStats::buildCpuMs);
+                    if (partialFrame) {
+                        // T-642: as a host keeps its texture -- only the dirty rectangles are cleared
+                        // and redrawn; every other pixel still holds the previous frame.
+                        renderer.clearRects(clearColor, damage.rects);
+                    } else {
+                        renderer.clear(clearColor);
+                    }
+                }
+                if (partialFrame) {
                     renderer.render(list, &shaper, &assets, irView, &ctx.perf(), &damage);
                 } else {
-                    renderer.clear(clearColor);
                     renderer.render(list, &shaper, &assets, irView, &ctx.perf());
                 }
+            }
+            ctx.perf().markFrameEnd();  // T-750: after the backend's submit and present
+            unaccounted.note(ctx.perf());
+            if (zonesOn) {
+                zoneFrames.note(ctx.perf());  // T-753
             }
             if (showDamage) {
                 drawDamageOverlay(pixels.data(), args.width, args.height, strideBytes, damage);
@@ -2726,9 +3171,19 @@ int main(int argc, char** argv) {
             }
         }
         if (args.perf) {
-            printPerfSummary(ctx.perf().summary(frameCount),
-                             frameCount > 0 ? 100.0f * damageAreaSum / static_cast<float>(frameCount) : 0.0f);
+            const uint32_t drawn = frameCount - idleSkipped;  // T-749: the frames updated and rendered
+            printPerfSummary(ctx.perf().summary(drawn),
+                             drawn > 0 ? 100.0f * damageAreaSum / static_cast<float>(drawn) : 0.0f,
+                             args.perfDetail);
+            if (args.idleSkip) {
+                std::printf("idle-skipped frames: %u of %u\n", static_cast<unsigned>(idleSkipped),
+                            static_cast<unsigned>(frameCount));
+            }
             gpuTotals.print(xt::view::rendererName(chosenRenderer));
+            unaccounted.print();  // T-750: the budget's closing line
+            if (zonesOn) {
+                zoneFrames.print();  // T-753: the second-level zones
+            }
         }
         if (!args.layersDir.empty() && frameTarget) {
             // T-701: the layers and their list, and the last frame of the layers view.
@@ -2818,6 +3273,10 @@ int main(int argc, char** argv) {
             std::printf("xtframe-view: window run complete (%u frames)\n", frameCount);
             return 0;
         }
+        if (ctx.visualCheck().mismatches > 0) {  // T-748: --verify-static-skip (or the env switch)
+            std::fprintf(stderr, "xtframe-view: static skip verify: %u mismatching frame(s); first: %s\n",
+                         ctx.visualCheck().mismatches, ctx.visualCheck().first.c_str());
+        }
         std::printf("xtframe-view: headless run complete (%u frames)\n", frameCount);
         return 0;
     }
@@ -2866,6 +3325,11 @@ int main(int argc, char** argv) {
     // T-263e: xt_core asks the file system nothing itself; the R key's revalidate() compares the
     // decoded files with the disk through this (after setAssetRoot, which replaces the resolver).
     app.assetResolver().setFileStatusFn(&xt::fileStatusUtf8);
+    if (args.bundle) {
+        // T-759: the bundle's atlas cells, slices and @2x / @3x variants (after setAssetRoot, which
+        // replaces the resolver), or an atlased image draws its whole page.
+        args.bundle->registerImageMeta(app.assetResolver());
+    }
 #ifndef XT_GL_NO_TEXT
     addBundleFonts(args, app.textShaper());  // T-555: before the system fonts.
     if (!args.noSystemFonts) {
@@ -2873,7 +3337,8 @@ int main(int argc, char** argv) {
     }
 #endif
     // T-150: after setAssetRoot (which replaces the resolver), before the first update().
-    if (!bindExternalTextures(args, app.assetResolver(), /*upload=*/true)) {
+    if (!bindExternalTextures(args, app.assetResolver(), /*upload=*/true) ||
+        !bindPlanarTextures(args, app.assetResolver(), /*upload=*/true, nullptr)) {
         return 1;
     }
     if (!setupLanguage(args, rootDir, localization, app.context())) {
@@ -2956,11 +3421,20 @@ int main(int argc, char** argv) {
 
     bool paused = false;
 
+    if (args.idleSkip) {
+        std::fprintf(stderr,
+                     "xtframe-view: --idle-skip applies to --headless and --renderer runs; ignored\n");
+    }
     // T-244: --stats also reports the rig workload, which comes from the perf tracer.
     app.context().perf().setEnabled(args.perf || args.stats);
+    app.context().perf().setDetail(args.perfDetail);        // T-747
+    app.context().perf().setThreadCpuTiming(args.perfCpu);  // T-753
+    if (args.verifyStaticSkip) {
+        app.context().setVerifyStaticSkip(true);  // T-748
+    }
     std::unique_ptr<PerfCsvWriter> csv;
     if (!args.perfCsv.empty()) {
-        csv = std::make_unique<PerfCsvWriter>(args.perfCsv);
+        csv = std::make_unique<PerfCsvWriter>(args.perfCsv, args.warmup);
         if (!csv->ok()) {
             std::fprintf(stderr, "xtframe-view: failed to open '%s' for writing\n", args.perfCsv.c_str());
             return 1;
@@ -2970,8 +3444,16 @@ int main(int argc, char** argv) {
     float titleTimer = 0.0f;
 
     uint32_t frameIndex = 0;
+    UnaccountedTotals unaccounted;  // T-750
     auto onFrame = [&](float dt) {
+        // T-750: one shell frame runs from here to the next onFrame (present and the event pump
+        // included); the flow ticks below run before Context::update() opens the record and stay in
+        // `unaccounted`.
+        app.context().perf().markFrameEnd();
+        unaccounted.note(app.context().perf());
+        app.context().perf().markFrameStart();
         // T-125: onFrame runs before Context::update(), which drains the queue this fills.
+        raiseTextureVersions(args, app.assetResolver(), frameIndex);  // T-746
         applyScriptedInput(args, app.context(), handle, frameIndex++, systemEvent);
         // T-139: --dump-every also works in the windowed run (same block as headless), so a
         // windowed interaction can be checked from stdout.
@@ -3060,12 +3542,25 @@ int main(int argc, char** argv) {
                         packProject(args.packSource, args.bundleDir, args.standardSymbolDir,
                                     args.standardFontDir, args.verbose);
                     }
-#ifndef XT_GL_NO_TEXT
                     if (args.bundle) {
+                        // T-759: the previous manifest's image meta leaves this resolver (a cell
+                        // may have moved, an asset may be gone) and the re-read one comes in.
+                        xt::AssetResolver& resolver = app.assetResolver();
+                        for (const xt::bundle::AssetInfo& info : args.bundle->assetTable()) {
+                            resolver.clearImageMeta(info.file);
+                        }
+                        for (const xt::bundle::AtlasInfo& atlas : args.bundle->atlases()) {
+                            for (const xt::bundle::AtlasEntryInfo& entry : atlas.entries) {
+                                resolver.clearImageMeta(std::string(xt::kAtlasAssetScheme) + atlas.name +
+                                                        "#" + entry.asset);
+                            }
+                        }
                         (void)args.bundle->reload();  // T-555: a font the re-packed UI newly names.
+                        args.bundle->registerImageMeta(resolver);
+#ifndef XT_GL_NO_TEXT
                         addBundleFonts(args, app.textShaper());
-                    }
 #endif
+                    }
                     // T-263c: an image file rewritten under the same name is decoded again.
                     // T-263e: and a file that did not exist when it was first asked for is
                     // looked for again (a failed lookup has no file to revalidate).
@@ -3200,7 +3695,9 @@ int main(int argc, char** argv) {
             csv->writeNewFrames(app.context().perf());
         }
         std::printf("xtframe-view: render/effects/text are GL CPU submission times (no glFinish)\n");
-        printPerfSummary(app.context().perf().summary(xt::PerfTracker::kHistoryCapacity));
+        printPerfSummary(app.context().perf().summary(xt::PerfTracker::kHistoryCapacity), -1.0f,
+                         args.perfDetail);
+        unaccounted.print();  // T-750
     }
     return exitCode;
 }

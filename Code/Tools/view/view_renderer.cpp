@@ -211,6 +211,14 @@ public:
         unpremultiply(rgba);
         return true;
     }
+    uint32_t createHostTexture(int w, int h, bool r8, const void* data) override {  // T-806
+        m_platform.glMakeCurrent();
+        gpu::GpuDevice* device = m_renderer.renderer().device();
+        return device != nullptr
+                   ? device->createTexture("xtframe-view host", uint16_t(w), uint16_t(h),
+                                           r8 ? gpu::TextureFormat::R8 : gpu::TextureFormat::Rgba8, data)
+                   : 0;
+    }
     void present() override {
         if (!m_windowed) return;
         int w = 0, h = 0;
@@ -329,7 +337,11 @@ public:
     }
     void render(const CommandList& list, TextShaper* shaper, AssetResolver* assets, const IrView* ir,
                 PerfTracker* perf, const DamageList* damage) override {
-        m_renderer.beginFrame();
+        {
+            // T-750: the frames-in-flight limit (and the swap chain acquire) is FrameRecord's `wait`.
+            PerfPhaseScope waitScope(perf, &FrameStats::waitMs, &FrameStats::waitCpuMs);
+            m_renderer.beginFrame();
+        }
         m_renderer.render(list, shaper, assets, ir, perf, damage);
     }
     bool read(std::vector<uint8_t>& rgba, int& width, int& height) override {
@@ -338,6 +350,13 @@ public:
         return true;
     }
     void present() override { m_renderer.present(); }
+    uint32_t createHostTexture(int w, int h, bool r8, const void* data) override {  // T-806
+        xt::wgpu::WgpuDevice* device = m_renderer.renderer().device();
+        return device != nullptr
+                   ? device->createTexture("xtframe-view host", uint16_t(w), uint16_t(h),
+                                           r8 ? gpu::TextureFormat::R8 : gpu::TextureFormat::Rgba8, data)
+                   : 0;
+    }
     double seconds() const override { return m_windowed ? m_platform.seconds() : 0.0; }
 #ifndef XT_BACKEND_NO_TEXT
     void setTextShaper(text::FtTextShaper* shaper) override {

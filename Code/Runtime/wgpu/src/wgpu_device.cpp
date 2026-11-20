@@ -53,7 +53,7 @@ uint32_t unitBytes(gpu::TextureFormat fmt) {
 uint32_t roundUp(uint32_t v, uint32_t a) { return (v + a - 1) / a * a; }
 
 /// How many parameter floats a command's shader reads (gpu_frame.h's *Params sizes); 0 = none.
-uint32_t paramFloats(const gpu::DrawCmd& cmd) {
+uint32_t paramFloats(const gpu::GpuFrame& frame, const gpu::DrawCmd& cmd) {
     using gpu::EffectProgram;
     using gpu::Shading;
     if (cmd.kind == gpu::DrawKind::Particles) {
@@ -72,6 +72,8 @@ uint32_t paramFloats(const gpu::DrawCmd& cmd) {
             return sizeof(gpu::CompositeParams) / sizeof(float);
         case Shading::BoxShadow:
             return sizeof(gpu::BoxShadowParams) / sizeof(float);  // T-668
+        case Shading::TexturePlanar:
+            return sizeof(gpu::PlanarParams) / sizeof(float);  // T-806
         case Shading::Effect:
             switch (cmd.program) {
                 case EffectProgram::GaussScalar:
@@ -103,10 +105,9 @@ uint32_t paramFloats(const gpu::DrawCmd& cmd) {
                     return sizeof(gpu::KawaseParams) / sizeof(float);
                 case EffectProgram::LevelMix:
                     return sizeof(gpu::LevelMixParams) / sizeof(float);
-                case EffectProgram::Backdrop:
-                case EffectProgram::BackdropMasked:  // T-729: BackdropParams is read here, not uploaded
-                case EffectProgram::None:
-                default:
+                case EffectProgram::BackdropMasked:  // T-729: read here; T-764: uploaded with texture inputs
+                    return gpu::backdropTexturedFloats(frame, cmd);
+                default:  // Backdrop, None
                     return 0;
             }
         default:
@@ -1098,7 +1099,7 @@ void WgpuDevice::planFrame(const gpu::GpuFrame& frame) {
     std::unordered_map<uint32_t, uint32_t> byIndex;
     for (size_t c = 0; c < frame.cmds.size(); ++c) {
         const gpu::DrawCmd& cmd = frame.cmds[c];
-        const uint32_t floats = paramFloats(cmd);
+        const uint32_t floats = paramFloats(frame, cmd);
         if (floats == 0) {
             continue;  // offset 0: the zero block
         }

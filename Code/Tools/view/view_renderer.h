@@ -119,6 +119,16 @@ public:
                         PerfTracker* perf, const DamageList* damage) = 0;
     /// The last frame as straight-alpha RGBA8, row 0 = top (call before present() for a window).
     virtual bool read(std::vector<uint8_t>& rgba, int& width, int& height) = 0;
+    /// T-806: a `w` x `h` texture on the renderer's device holding `data` (R8 when `r8`, else RGBA8 as
+    /// given), standing in for a host texture (`--bind-texture`, `--bind-planar`); its handle for
+    /// AssetResolver::setExternalTexture, or 0 when the renderer has no device textures (sw).
+    virtual uint32_t createHostTexture(int w, int h, bool r8, const void* data) {
+        (void)w;
+        (void)h;
+        (void)r8;
+        (void)data;
+        return 0;
+    }
     virtual void present() = 0;
     virtual double seconds() const = 0;
 #ifndef XT_BACKEND_NO_TEXT

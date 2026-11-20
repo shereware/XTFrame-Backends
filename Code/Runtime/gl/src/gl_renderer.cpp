@@ -104,12 +104,37 @@ struct GlRenderer::Impl {
             device.stats().buildMs =
                 std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - b0).count();
         }
-        device.submit(frame);
+        {
+            PerfPhaseScope submitScope(perf, &FrameStats::submitMs, &FrameStats::submitCpuMs);  // T-750
+            device.submit(frame);
+        }
         lastWarning = device.takeWarning();  // T-203: a custom shader that failed to compile.
         if (stats != nullptr) {
             // T-457: CPU submission time per kind, the meaning xt_wgpu gives them (21 §21.2).
             stats->effectsMs += device.lastStats().effectsMs;
             stats->textMs += device.lastStats().textMs;
+            // T-750 (57 §57.5 item 2): the backend's statistics into the frame's record.
+            const auto& d = device.lastStats();
+            stats->backend = static_cast<uint32_t>(PerfBackend::Gl);
+            stats->submitPlanMs += d.targetMs;
+            stats->submitUploadMs += d.uploadMs;
+            stats->submitEncodeMs += d.drawMs + d.endFrameMs;
+            stats->passes += d.passes;
+            stats->drawCalls += d.drawCalls;
+            stats->pipelineBinds += d.programBinds;
+            stats->uploadBytes = saturateU32(uint64_t(stats->uploadBytes) + d.uploadBytes);
+            stats->transientCreates += d.transientCreates;
+            stats->frameReused += frameReused ? 1u : 0u;
+            if (!frameReused) {
+                const gpu::FrameBuilder::EffectCacheStats c = builder.lastEffectCacheStats();
+                stats->effectCacheHits += c.hits;
+                stats->effectCacheMisses += c.misses;
+                const gpu::FrameBuilder::CoverageStats cov = builder.lastCoverageStats();
+                stats->coverageHits += cov.hits;
+                stats->coverageMisses += cov.misses;
+            }
+            stats->effectCacheBytes = saturateU32(d.cachedBytes);
+            stats->transientPoolBytes = saturateU32(d.poolBytes);
         }
 
         if (builder.lastError()[0] != '\0') {

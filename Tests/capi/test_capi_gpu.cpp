@@ -2238,7 +2238,22 @@ TEST_CASE("capi gpu 7 (T-636): a Win32 window target presents and reads back ins
         desc.window.kind = XT_WINDOW_WIN32;
         desc.window.u.win32.hwnd = hwnd;
         desc.vsync = 0;
+        // T-749: the target's surface-usage line -- its frames go into the swapchain texture itself,
+        // never through the T-758 intermediate, whatever usages the swapchain offers.
+        std::string usageLine;
+        xt_capi_set_log(
+            [](int, const char* message, void* user) {
+                if (std::strstr(message, "surface usages") != nullptr)
+                    *static_cast<std::string*>(user) = message;
+            },
+            &usageLine);
         xt_gpu_target* t = xt_gpu_target_create(&desc);
+        xt_capi_set_log(nullptr, nullptr);
+        if (t != nullptr) {
+            INFO(usageLine);
+            CHECK(usageLine.find("frames drawn into the surface") != std::string::npos);
+            CHECK(usageLine.find("intermediate texture,") == std::string::npos);
+        }
         if (t == nullptr) {
             const std::string error = xt_capi_last_error();
             DestroyWindow(hwnd);

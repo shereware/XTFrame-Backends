@@ -69,6 +69,8 @@ bool RendererWgpu::create(const WgpuSurfaceSource& source, int width, int height
         return false;
     }
     m_format = m_surface.format();
+    // T-758 (10 §10.20 2026-11-18 note (1)): whether frames sample the surface or an intermediate.
+    std::fprintf(stderr, "xt::wgpu: %s\n", m_surface.usageNote().c_str());
     m_width = width > 0 ? width : 1;
     m_height = height > 0 ? height : 1;
     m_surface.configure(m_init.device, m_width, m_height);
@@ -184,7 +186,7 @@ void RendererWgpu::render(const CommandList& list, TextShaper* shaper, AssetReso
 bool RendererWgpu::readPixels(std::vector<uint8_t>& rgba, int& width, int& height) {
     // Offscreen: the texture keeps the last frame after present(); a surface texture only until then.
     WGPUTexture texture = m_frameTexture != nullptr ? m_frameTexture : m_offscreen;
-    if (texture == nullptr || (m_frameFromSurface && (m_surface.usage() & WGPUTextureUsage_CopySrc) == 0)) {
+    if (texture == nullptr || (m_frameFromSurface && !m_surface.frameCopyable())) {
         return false;
     }
     width = static_cast<int>(wgpuTextureGetWidth(texture));

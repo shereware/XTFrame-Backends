@@ -80,6 +80,7 @@ enum ShaderId : uint16_t {
     kShCoverageGradient,  ///< T-660b: Gradient with DrawCmd::coverage
     kShBoxShadow,         ///< T-668: Shading::BoxShadow (T-683: one shape)
     kShBoxShadowMulti,    ///< T-683: Shading::BoxShadow with DrawCmd::boxShadowMulti (up to three shapes)
+    kShTexturePlanar,     ///< T-806: Shading::TexturePlanar (Docs/design/23-host-integration.md §23.aj)
     kShFxGaussScalar,
     kShFxGaussColor,
     kShFxDilate,

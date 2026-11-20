@@ -7,6 +7,7 @@ add_library(xt_gl STATIC
     src/gl_state_cache.cpp
     src/gl_effects.cpp
     src/gl_device.cpp
+    src/gl_planar.cpp  # T-806: Shading::TexturePlanar (Docs/design/23-host-integration.md §23.aj)
     src/gl_renderer.cpp
 )
 target_include_directories(xt_gl PUBLIC include)

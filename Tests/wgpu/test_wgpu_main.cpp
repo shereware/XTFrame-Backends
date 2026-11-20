@@ -3,6 +3,7 @@
 
 #include "doctest.h"
 #include "test_temp.h"
+#include "test_visual_check.h"
 #include "test_watchdog.h"
 #include "test_wgpu_common.h"
 
@@ -39,6 +40,7 @@ int main(int argc, char** argv) {
         return 0;
     }
     xt::test::startWatchdog();
+    xt::test::enableVisualCheck();  // T-748: the static skip's verify mode in every Context.
     const int rc = xt::test::finishTempDir(doctest::Context(argc, argv).run());
     xt::wgpu::test::g_init.release();
     return rc;

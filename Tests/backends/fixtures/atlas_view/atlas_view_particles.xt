@@ -1,0 +1,37 @@
+<xt version="2">
+
+  <!-- T-759: a textured emitter whose texture is an atlas cell (the <img> of the same file is what
+       puts it on the page: xtframe-pack atlases image uses, not emitter textures alone), for
+       Tests/backends/view_atlas.cmake. -->
+  <body>
+    <img id="pic" src="img/checker.png"/>
+    <particles id="snow" shape="edge" texture="img/checker.png" rate="30" burst="12" lifetime="2"
+               speed="20 40" direction="90" spread="20" size="10" autoplay></particles>
+  </body>
+
+  <layout>
+    body {
+      width: 320px;
+      height: 240px;
+    }
+    #pic {
+      position: absolute;
+      left: 8px;
+      top: 8px;
+      width: 32px;
+      height: 32px;
+    }
+    #snow {
+      position: absolute;
+      left: 8px;
+      top: 150px;
+      width: 300px;
+      height: 4px;
+    }
+  </layout>
+  <style>
+    body {
+      background-color: #203040;
+    }
+  </style>
+</xt>

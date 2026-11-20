@@ -69,23 +69,6 @@ struct Diff {
     double mean = 0;
 };
 
-/// T-733: a CPU adapter (lavapipe, WARP: WGPUAdapterType_CPU in the shared adapter's info) may
-/// differ by 1 in a channel where a hardware adapter is byte for byte. Printed once.
-bool cpuAdapter() {
-    static const bool cpu = [] {
-        WGPUAdapterInfo info = WGPU_ADAPTER_INFO_INIT;
-        const WGPUAdapter adapter = xt::wgpu::test::sharedInit().adapter;
-        bool isCpu = false;
-        if (adapter != nullptr && wgpuAdapterGetInfo(adapter, &info) == WGPUStatus_Success) {
-            isCpu = info.adapterType == WGPUAdapterType_CPU;
-            wgpuAdapterInfoFreeMembers(info);
-        }
-        std::printf("wgpu backdrop cache: %s adapter\n", isCpu ? "CPU" : "hardware");
-        return isCpu;
-    }();
-    return cpu;
-}
-
 Diff diffOf(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) {
     Diff d;
     double sum = 0;
@@ -220,5 +203,107 @@ TEST_CASE("wgpu backdrop cache: T-730 a panel cut by the surface edge hits with 
             CHECK(s.renderer.stats().backdropPairHits == 1u);
         }
         CHECK(diffOf(px, uncached(cl)).maxChannel == 0);
+    }
+}
+
+namespace {
+
+/// T-764: two glass panels (two pairs) over the stripes.
+CommandList twoGlass(const Panel& a, const Panel& b) {
+    CommandList cl = glassList(a);
+    const CommandList second = glassList(b);
+    const uint32_t verbBase = static_cast<uint32_t>(cl.verbs.size());
+    const uint32_t pointBase = static_cast<uint32_t>(cl.points.size());
+    const uint32_t fillBase = static_cast<uint32_t>(cl.fills.size());
+    const uint32_t effectBase = static_cast<uint32_t>(cl.effects.size());
+    const uint32_t effectCmdBase = static_cast<uint32_t>(cl.effectCmds.size());
+    cl.verbs.insert(cl.verbs.end(), second.verbs.begin(), second.verbs.end());
+    cl.points.insert(cl.points.end(), second.points.begin(), second.points.end());
+    for (FillCmd f : second.fills) {
+        f.path.verbOffset += verbBase;
+        f.path.pointOffset += pointBase;
+        cl.fills.push_back(f);
+    }
+    cl.effects.insert(cl.effects.end(), second.effects.begin(), second.effects.end());
+    for (EffectCmd e : second.effectCmds) {
+        e.effectOffset += effectBase;
+        cl.effectCmds.push_back(e);
+    }
+    for (size_t i = 10; i < second.commands.size(); ++i) {  // after the second list's 10 stripes
+        Command c = second.commands[i];
+        if (c.kind == CmdKind::FillPath) {
+            c.index += fillBase;
+        } else if (c.kind == CmdKind::PushEffect) {
+            c.index += effectCmdBase;
+        }
+        cl.commands.push_back(c);
+    }
+    return cl;
+}
+
+}  // namespace
+
+TEST_CASE("wgpu backdrop cache: T-764 two panels sampled from their pairs, byte for byte") {
+    // The pairs are read straight from the cached textures (WgpuDevice::supportsBackdropMaskTextures);
+    // Tests/gpu/test_backdrop_cache.cpp checks the frames (two passes fewer per panel).
+    Session s(kW, kH);
+    for (int i = 0; i < 5; ++i) {
+        CAPTURE(i);
+        Panel a, b;
+        a.at = Vec2{10, 10};
+        b.at = Vec2{120, 80};
+        b.content = Color{0.9f, 0.95f, 1, 0.4f};
+        a.stripes = b.stripes = i >= 3 ? static_cast<float>(i) * 4.0f : 0.0f;
+        const CommandList cl = twoGlass(a, b);
+        const std::vector<uint8_t> px = s.render(cl);
+        CHECK_MESSAGE(s.error.empty(), s.error);
+        if (i >= 2) {
+            CHECK(s.renderer.stats().backdropPairHits == 2u);
+        }
+        CHECK(diffOf(px, uncached(cl)).maxChannel == 0);
+    }
+}
+
+TEST_CASE("wgpu backdrop cache: T-764 two panels moving by whole pixels and by fractions, then at rest") {
+    Session s(kW, kH);
+    const float xs[] = {10.0f, 11.0f, 12.0f, 12.25f, 12.5f, 12.75f, 13.125f};
+    Panel a, b;
+    for (size_t i = 0; i < sizeof(xs) / sizeof(xs[0]); ++i) {
+        CAPTURE(i);
+        a.at = Vec2{xs[i], 10.0f};
+        b.at = Vec2{120.0f - xs[i], 70.0f + 0.5f * static_cast<float>(i)};
+        const CommandList cl = twoGlass(a, b);
+        const std::vector<uint8_t> px = s.render(cl);
+        CHECK_MESSAGE(s.error.empty(), s.error);
+        const Diff d = diffOf(px, uncached(cl));
+        std::printf("T-764 two panels, frame %zu: %u pair hits, max channel diff %d, mean %.4f\n", i,
+                    s.renderer.stats().backdropPairHits, d.maxChannel, d.mean);
+        CHECK(d.maxChannel <= 64);  // T-730 / T-721: a fraction of a pixel away, bilinear
+        CHECK(d.mean <= 0.25);
+    }
+    // At rest: the settle in full, then the pairs at the same phase, byte for byte.
+    const CommandList rest = twoGlass(a, b);
+    const std::vector<uint8_t> reference = uncached(rest);
+    s.render(rest);
+    for (int i = 0; i < 2; ++i) {
+        const std::vector<uint8_t> px = s.render(rest);
+        CHECK(s.renderer.stats().backdropPairHits == 2u);
+        CHECK(diffOf(px, reference).maxChannel == 0);
+    }
+}
+
+TEST_CASE("wgpu backdrop cache: T-764 a panel cut by the surface edge moving by whole pixels") {
+    Session s(kW, kH);
+    for (int i = 0; i < 6; ++i) {
+        CAPTURE(i);
+        Panel p;
+        p.at = Vec2{-40.0f + static_cast<float>(i), 20.0f};
+        const CommandList cl = glassList(p);
+        const std::vector<uint8_t> px = s.render(cl);
+        CHECK_MESSAGE(s.error.empty(), s.error);
+        const Diff d = diffOf(px, uncached(cl));
+        std::printf("T-764 edge, frame %d: %u pair hits, max channel diff %d\n", i,
+                    s.renderer.stats().backdropPairHits, d.maxChannel);
+        CHECK(d.maxChannel <= (cpuAdapter() ? 1 : 0));
     }
 }

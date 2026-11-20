@@ -1,0 +1,59 @@
+<xt version="2">
+
+  <!-- T-759: one of each image use an atlas cell serves (an <img>, a background image, a
+       border-image), for Tests/backends/view_atlas.cmake: the screenshot of the
+       `xtframe-pack --atlas` bundle must be byte-identical to the plain bundle's on every renderer.
+       Every image is drawn at or above its own size, so no mip level of a page differs from the
+       file's. The textured emitter is atlas_view_particles.xt. -->
+  <body>
+    <img id="pic" src="img/minify.png"/>
+    <div id="bg"></div>
+    <div id="frame"></div>
+  </body>
+
+  <layout>
+    body {
+      width: 320px;
+      height: 240px;
+    }
+    #pic {
+      position: absolute;
+      left: 8px;
+      top: 8px;
+      width: 128px;
+      height: 128px;
+    }
+    #bg {
+      position: absolute;
+      left: 152px;
+      top: 8px;
+      width: 96px;
+      height: 64px;
+    }
+    #frame {
+      position: absolute;
+      left: 152px;
+      top: 88px;
+      width: 160px;
+      height: 96px;
+    }
+  </layout>
+  <style>
+    body {
+      background-color: #203040;
+    }
+    #pic {
+      object-fit: fill;
+    }
+    #bg {
+      background-color: #dddddd;
+      background-image: url("img/checker.png");
+      background-size: 32px 32px;
+      background-position: center;
+      background-repeat: no-repeat;
+    }
+    #frame {
+      border-image: url("img/nine.png") 8 fill;
+    }
+  </style>
+</xt>
