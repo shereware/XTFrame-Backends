@@ -1558,6 +1558,26 @@ TEST_CASE("gl custom: XtInput.boxSize is the border box in CSS px at any dpr (T-
     }
 }
 
+// T-831: a scene node's geometry box does not start at its local origin; `local` is
+// (local point - box.xy) / box.wh.
+TEST_CASE("gl custom: XtInput.local over a box whose origin is not 0,0 (T-831)") {
+    const std::string glsl = glslOf(kLocalXtfx);
+    CommandList cl = makeList();
+    addShader(cl, 8, glsl, {}, {}, EffectInstance{});
+    const Mat2x3 xf = translation(Vec2{10, 10});
+    const Rect box{20, 8, 16, 16};
+    const Rect aabb = transformBounds(xf, box);
+    addPushEffect(cl, {customFx(8, {})}, xf, aabb, aabb);
+    cl.effectCmds.back().localBox = box;
+    addFillRect(cl, box.x, box.y, box.w, box.h, Color{1, 1, 1, 1});
+    cl.fills.back().xf = xf;
+    addPopEffect(cl);
+    GlSession gl(64, 64);
+    // Local point (24.5, 20.5) = box point (4.5, 12.5) sits at screen pixel (34, 30).
+    checkLocalCorner(gl.render(cl), 34, 30, "box at (20, 8)");
+    CHECK(std::string(gl.renderer.lastWarning()).empty());
+}
+
 TEST_CASE("gl golden: gl-only UI fixtures (custom effects) match their expected images") {
     const std::string uiDir = XT_GOLDEN_UI_DIR;
     const std::vector<golden::UiFixture> fixtures = golden::loadUiManifest(uiDir + "/manifest.txt");

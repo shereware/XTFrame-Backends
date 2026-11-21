@@ -19,9 +19,12 @@
 namespace xt::tools::view {
 
 /// Reads `path` (a `.xtflow` file) and loads it against `handle`'s Document into `runtime`.
-/// Diagnostics/errors are printed to stderr (one line per problem); returns false on failure.
+/// Diagnostics/errors are printed to stderr, one line per problem: `xtframe-view: flow: <problem>`,
+/// or (T-827) `xtframe-view: flow: <ui>: <problem>` when `ui` names the UI whose own flow this is.
+/// Returns false on failure.
 inline bool loadFlow(xt::Context& ctx, xt::DocumentHandle handle, const std::string& path,
-                     xt::flow::FlowRuntime& runtime) {
+                     xt::flow::FlowRuntime& runtime, const std::string& ui = std::string()) {
+    const std::string label = ui.empty() ? std::string("flow") : "flow: " + ui;
     std::ifstream in(xt::compile::pathFromUtf8(path), std::ios::binary);
     if (!in) {
         std::fprintf(stderr, "xtframe-view: failed to read flow file '%s'\n", path.c_str());
@@ -33,20 +36,20 @@ inline bool loadFlow(xt::Context& ctx, xt::DocumentHandle handle, const std::str
     std::vector<std::string> errors;
     if (xt::flow::FlowGraph::parse(json, graph, errors) != xt::Status::kOk) {
         for (const std::string& e : errors) {
-            std::fprintf(stderr, "xtframe-view: flow: %s\n", e.c_str());
+            std::fprintf(stderr, "xtframe-view: %s: %s\n", label.c_str(), e.c_str());
         }
         return false;
     }
 
     xt::Document* doc = ctx.document(handle);
     if (doc == nullptr) {
-        std::fprintf(stderr, "xtframe-view: flow: no document loaded\n");
+        std::fprintf(stderr, "xtframe-view: %s: no document loaded\n", label.c_str());
         return false;
     }
     errors.clear();
     if (runtime.load(graph, *doc, errors) != xt::Status::kOk) {
         for (const std::string& e : errors) {
-            std::fprintf(stderr, "xtframe-view: flow: %s\n", e.c_str());
+            std::fprintf(stderr, "xtframe-view: %s: %s\n", label.c_str(), e.c_str());
         }
         return false;
     }
@@ -71,15 +74,16 @@ inline bool reportFlowContinuity(const xt::flow::FlowRuntime& runtime, bool stri
 /// R (reload) after the new Document was loaded at `handle` beside the one at `previous`: loads
 /// the flow file at `flowPath` against the new one again when `hasFlow`, then unloads `previous`.
 /// Returns whether a flow graph is loaded afterwards (false: the run goes on without one, the
-/// error already printed by loadFlow()).
+/// error already printed by loadFlow(); `ui` as there).
 inline bool reloadFlow(xt::Context& ctx, xt::DocumentHandle previous, xt::DocumentHandle handle,
-                       const std::string& flowPath, bool hasFlow, xt::flow::FlowRuntime& runtime) {
+                       const std::string& flowPath, bool hasFlow, xt::flow::FlowRuntime& runtime,
+                       const std::string& ui = std::string()) {
     // T-260c: off the previous Document first, whatever happens next: loadFlow() can fail before
     // it reaches FlowRuntime::load() (an unreadable or unparsable file), which would leave the
     // runtime's listeners on a Document that is unloaded below.
     runtime.unload();
     if (hasFlow) {
-        hasFlow = loadFlow(ctx, handle, flowPath, runtime);
+        hasFlow = loadFlow(ctx, handle, flowPath, runtime, ui);
     }
     ctx.unloadDocument(previous);
     return hasFlow;

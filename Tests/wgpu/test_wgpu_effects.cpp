@@ -408,6 +408,35 @@ TEST_CASE("wgpu custom: a full-screen node moved: local follows it, uv does not 
     CHECK(near(pixel(b, 64, 32, 32)[1], 98) <= 2);   // local.x = 24.5 / 64
 }
 
+// T-831: a scene node's geometry box does not start at its local origin; `local` is
+// (local point - box.xy) / box.wh.
+TEST_CASE("wgpu custom: XtInput.local over a box whose origin is not 0,0 (T-831)") {
+    const std::string glsl = glslOf(
+        "---\n"
+        "float4 xtMain(XtInput i) {\n"
+        "    return float4(i.local.x, i.local.y, i.boxSize.x / 64, 1);\n"
+        "}\n");
+    CommandList cl = makeList(64, 64);
+    addShader(cl, 8, glsl, {}, {}, EffectInstance{});
+    const Mat2x3 xf = translation(Vec2{10, 10});
+    const Rect box{20, 8, 16, 16};
+    const Rect aabb = transformBounds(xf, box);
+    addPushEffect(cl, {customFx(8, {})}, aabb, aabb);
+    cl.effectCmds.back().xf = xf;
+    cl.effectCmds.back().localBox = box;
+    addFillRect(cl, box.x, box.y, box.w, box.h, Color{1, 1, 1, 1});
+    cl.fills.back().xf = xf;
+    addPopEffect(cl);
+    Session s(64, 64);
+    const std::vector<uint8_t> a = s.render(cl);
+    CHECK_MESSAGE(s.warning.empty(), s.warning);
+    CHECK_MESSAGE(s.error.empty(), s.error);
+    // Local point (24.5, 20.5) = box point (4.5, 12.5) sits at screen pixel (34, 30).
+    CHECK(near(pixel(a, 64, 34, 30)[0], 72) <= 2);   // (24.5 - 20) / 16
+    CHECK(near(pixel(a, 64, 34, 30)[1], 199) <= 2);  // (20.5 - 8) / 16
+    CHECK(near(pixel(a, 64, 34, 30)[2], 64) <= 2);   // boxSize.x / 64
+}
+
 TEST_CASE("wgpu custom: XtInput.boxSize is the border box in CSS px at any dpr (T-818)") {
     const std::string glsl = glslOf(
         "---\n"

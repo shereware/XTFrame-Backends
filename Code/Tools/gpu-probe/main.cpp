@@ -67,6 +67,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <memory>
@@ -76,6 +77,7 @@
 #include <vector>
 
 #include "../Common/console_utf8.h"
+#include "../Common/ir_load_error.h"
 #include "../Common/spec_safe_area.h"
 #include "../view/view_events.h"
 #include "xt/bundle/bundle.h"
@@ -1007,7 +1009,13 @@ static int run(int argc, char** argv) {
                 safeGiven ? "--safe" : (bundle->spec() != nullptr ? "manifest spec" : "no spec"));
     xt::Result<xt::DocumentHandle> loaded = xt::bundle::loadUi(ctx, *bundle, uiId);
     if (!loaded.ok()) {
-        std::fprintf(stderr, "cannot load ui '%s' (%s)\n", uiId.c_str(), xt::statusName(loaded.status()));
+        // T-827: why the UI's `.xtir` is rejected (e.g. an IR of another major: "recompile the source").
+        const xt::bundle::UiInfo* failed = bundle->ui(uiId);
+        const std::string why = xt::tools::irFileLoadFailure(
+            loaded.status(), failed == nullptr ? std::filesystem::path()
+                                               : xt::compile::pathFromUtf8(std::string(bundle->dir())) /
+                                                     xt::compile::pathFromUtf8(failed->file));
+        std::fprintf(stderr, "cannot load ui '%s' (%s)\n", uiId.c_str(), why.c_str());
         return 1;
     }
     const xt::DocumentHandle doc = loaded.value();

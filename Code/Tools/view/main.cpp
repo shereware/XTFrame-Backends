@@ -21,7 +21,8 @@
                         // GL upload.
 #endif
 #include "../Common/console_utf8.h"
-#include "../Common/planar_pack.h"  // T-806: --bind-planar
+#include "../Common/ir_load_error.h"  // T-827
+#include "../Common/planar_pack.h"    // T-806: --bind-planar
 #include "../Common/print_version.h"
 #include "../Common/spec_safe_area.h"
 #include "../Common/standard_symbols_note.h"
@@ -2257,19 +2258,13 @@ bool loadInto(xt::Context& ctx, const std::string& path, const std::string& root
     }
 
     if (!result.ok()) {
-        // T-702: the validator's reason after the status (IrView::openError(); empty when the IR
-        // itself passes and the Document failed later).
-        std::string why;
-        if (result.status() == xt::Status::kInvalidIr) {
-            std::vector<uint8_t> bytes = compiled;
-            if (bytes.empty()) {
-                std::ifstream in(inputPath, std::ios::binary);
-                bytes.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
-            }
-            why = xt::IrView::openError(xt::IrBlob{bytes.data(), bytes.size()});
-        }
-        std::fprintf(stderr, "xtframe-view: failed to load '%s' (%s%s%s)\n", path.c_str(),
-                     xt::statusName(result.status()), why.empty() ? "" : ": ", why.c_str());
+        // T-702: the validator's reason after the status (T-827: Common/ir_load_error.h, shared
+        // with the other tools; nothing after it when the IR passes and the Document failed later).
+        const std::string why =
+            compiled.empty()
+                ? xt::tools::irFileLoadFailure(result.status(), inputPath)
+                : xt::tools::irLoadFailure(result.status(), xt::IrBlob{compiled.data(), compiled.size()});
+        std::fprintf(stderr, "xtframe-view: failed to load '%s' (%s)\n", path.c_str(), why.c_str());
         return false;
     }
 
@@ -2837,6 +2832,12 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "xtframe-view: loaded flow %s\n", args.flow.c_str());
         }
     };
+    // T-827 (T-262b ruling): the UI's own flow (found, not given with --flow) that does not load is
+    // reported as `xtframe-view: flow: <ui>: <problem>` and the UI is shown without it; a --flow that
+    // does not load still exits 2. <ui>: the Bundle's UI id, else the input file's stem.
+    const std::string flowUi =
+        !args.flowAuto ? std::string()
+                       : (!args.mainUi.empty() ? args.mainUi : pathToUtf8(pathFromUtf8(args.input).stem()));
 
     const fs::path inputPath = pathFromUtf8(args.input);
     std::string rootDir = args.root.empty() ? pathToUtf8(inputPath.parent_path()) : args.root;
@@ -2986,8 +2987,12 @@ int main(int argc, char** argv) {
         targets.main = &flowRuntime;
         targets.ctx = &ctx;
         bool hasFlow = !args.flow.empty();
-        if (hasFlow && !loadFlow(ctx, handle, args.flow, flowRuntime)) {
-            return 2;
+        if (hasFlow && !loadFlow(ctx, handle, args.flow, flowRuntime, flowUi)) {
+            if (!args.flowAuto) {
+                return 2;
+            }
+            flowRuntime.unload();  // T-827: the UI runs on without its flow.
+            hasFlow = false;
         }
         if (hasFlow) {
             announceFlow();
@@ -3498,8 +3503,12 @@ int main(int argc, char** argv) {
     targets.main = &flowRuntime;
     targets.ctx = &app.context();
     bool hasFlow = !args.flow.empty();
-    if (hasFlow && !loadFlow(app.context(), handle, args.flow, flowRuntime)) {
-        return 2;
+    if (hasFlow && !loadFlow(app.context(), handle, args.flow, flowRuntime, flowUi)) {
+        if (!args.flowAuto) {
+            return 2;
+        }
+        flowRuntime.unload();  // T-827: the UI runs on without its flow.
+        hasFlow = false;
     }
     if (hasFlow) {
         announceFlow();
@@ -3676,7 +3685,7 @@ int main(int argc, char** argv) {
                         // reload re-reads the flow file too (view_flow.h). A failed reload leaves
                         // the run without a graph rather than killing the window.
                         hasFlow = xt::tools::view::reloadFlow(app.context(), previous, handle, args.flow,
-                                                              hasFlow, flowRuntime);
+                                                              hasFlow, flowRuntime, flowUi);
                         if (hasFlow) {
                             // T-546: the reloaded main flow's diagnostics print again, as at the
                             // first load; under --strict they print as errors but never exit
