@@ -224,7 +224,7 @@ void pickDxgiAdapter() {
         return;
     }
     IDXGIFactory4* factory = nullptr;
-    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory4), reinterpret_cast<void**>(&factory)))) {
+    if (FAILED(CreateDXGIFactory1(IID_IDXGIFactory4, reinterpret_cast<void**>(&factory)))) {
         return;
     }
     IDXGIAdapter1* a = nullptr;
@@ -234,7 +234,7 @@ void pickDxgiAdapter() {
         char name[256] = {0};
         WideCharToMultiByte(CP_UTF8, 0, d.Description, -1, name, sizeof(name) - 1, nullptr, nullptr);
         if (g_adapterName == name) {
-            a->QueryInterface(__uuidof(IDXGIAdapter3), reinterpret_cast<void**>(&g_dxgi));
+            a->QueryInterface(IID_IDXGIAdapter3, reinterpret_cast<void**>(&g_dxgi));
         }
         a->Release();
     }

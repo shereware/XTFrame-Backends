@@ -366,7 +366,9 @@
 /// --list-fonts (T-426) registers the system fonts (FtTextShaper::addSystemFonts()) and prints
 /// one `family<TAB>path` line per registered font file to stdout (path = the file it was
 /// registered from; UTF-8; sorted and deduplicated, T-429; T-569: a face of a `.ttc`/`.otc`
-/// collection is `path#<face index>`, e.g. `Microsoft JhengHei<TAB>C:/Windows/Fonts/msjh.ttc#0`), and exits
+/// collection is `path#<face index>`, e.g. `Microsoft JhengHei<TAB>C:/Windows/Fonts/msjh.ttc#0`; T-853: a face
+/// whose legacy family name differs from its typographic family adds `legacy<TAB>path<TAB>alias-of=family`,
+/// e.g. `Arial Narrow<TAB>C:/Windows/Fonts/ARIALN.TTF<TAB>alias-of=Arial`), and exits
 /// 0, whatever else is on the command line (--version still wins). --list-fonts=names prints only the family
 /// names, one per line, sorted and deduplicated (the T-426 output). Tools/Scripts/corpus_check.py uses it to
 /// check a corpus project's required fonts and their file hashes.
@@ -2802,6 +2804,12 @@ int main(int argc, char** argv) {
             }
             if (printable(path)) {
                 lines.insert(font.family + "\t" + path);
+                // T-853 (07 §7.21.2): a face whose legacy family (nameID 1) differs from its
+                // typographic family is also found by that name; listed as an alias line.
+                const std::string legacy = shaper.fontLegacyFamily(font.id);
+                if (!legacy.empty() && printable(legacy)) {
+                    lines.insert(legacy + "\t" + path + "\talias-of=" + font.family);
+                }
             }
         }
         for (const std::string& line : lines) {
