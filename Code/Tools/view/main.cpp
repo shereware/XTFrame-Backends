@@ -104,7 +104,8 @@
 ///                    [--bind-planar <name>=<file.png>[,yuv420|yuva420][,601|709][,limited|full]
 ///                                   [,left|center|topleft]]
 ///                    [--fit native|stretch|contain|cover|center] [--play <timeline>]
-///                    [--seek <seconds>] [--advance <seconds>] [--device W:H] [--safe F|T,R,B,L]
+///                    [--seek <seconds>] [--advance <seconds>] [--clock <seconds>]
+///                    [--device W:H] [--safe F|T,R,B,L]
 ///                    [--platform desktop|console|handheld] [--input mouse|gamepad|touch]
 ///                    [--lang <tag>] [--port <name>=<value>] [--gamepad] [--players N]
 ///                    [--borderless] [--resize-border N] [--no-live-resize]
@@ -186,6 +187,11 @@
 /// animations, particles with their fixed seed). --headless and --renderer runs only; the windowed
 /// run ignores it with a warning.
 ///
+/// --clock <seconds> (T-870, Docs/design/59-visual-feedback.md §59.7 item 3) sets the Context clock
+/// the run starts at, without stepping to it (Context::setClock() before the documents load): CSS
+/// animations, --play and the frames go on from there, and `xtTime` is that clock modulo 3600 s.
+/// With --advance the clock is set first, then advanced. Every run (windowed too).
+///
 /// --fit (Docs/tasks/T-156.md) chooses how the windowed run places the document: `native` lays it
 /// out at the window size (the behaviour before T-156); the other modes lay it out at the design
 /// size and scale/centre that image in the window (xt::shell::FitMode). A `bundle.xtproj` input
@@ -238,6 +244,12 @@
 ///   <move|down|up> <x> <y> [button=left|right|middle]"` is one raw pointer event, as --pointer
 ///   (button only with down/up; frame 0 when omitted). A `port <name> ''` value loses one pair of
 ///   outer quotes, as --port.
+///   T-871 (60 §60.7) adds `--event "[<frame>] wheel <dx> <dy> [<x> <y>]"`: one raw wheel event
+///   (notches, positive y scrolls down) at (x, y), else over the root element's centre (frame 0
+///   when omitted), through Context::pushInput (`on:wheel`, scroll containers).
+///   T-873 (60 §60.7) adds `"[<frame>] channel <name> <value> [<strength>] [relative|button]"` (one
+///   input-channel value), `"[<frame>] axis <pad.lx|ly|rx|ry|lt|rt> <value>"` (one gamepad axis
+///   motion) and `"[<frame>] key down|up <name>"` (one key edge); `key <name>` stays down + up.
 ///
 /// --verbose (T-571, 22 §22.14): a UI Project input lists every unused strings-table key
 /// (PackOptions::verbose) instead of one `i18n: N unused key(s) in <lang>.csv` line per table.
@@ -535,6 +547,7 @@ struct Args {
     std::vector<std::pair<std::string, std::string>> ports;  // T-175: --port name=value.
     float seekTime = -1.0f;                                  // T-172: --seek, < 0 = none.
     float advance = 0.0f;                                    // T-817: --advance, 0 = none.
+    double clock = -1.0;                                     // T-870: --clock, < 0 = none.
     bool gamepad = false;                                    // T-194: --gamepad.
     uint32_t players = 0;                                    // T-194: --players, 0 = not given.
     std::string project;                                     // T-193: --project <dir>.
@@ -1000,6 +1013,17 @@ bool parseArgs(int argc, char** argv, Args& out) {
             out.advance = std::strtof(v.c_str(), &end);
             if (end == v.c_str() || *end != '\0' || !(out.advance >= 0.0f) || !std::isfinite(out.advance)) {
                 std::fprintf(stderr, "xtframe-view: --advance: expected seconds >= 0, got '%s'\n", v.c_str());
+                return false;
+            }
+        } else if (arg == "--clock") {
+            std::string v;
+            if (!needValue("--clock", v)) {
+                return false;
+            }
+            char* end = nullptr;
+            out.clock = std::strtod(v.c_str(), &end);
+            if (end == v.c_str() || *end != '\0' || !(out.clock >= 0.0) || !std::isfinite(out.clock)) {
+                std::fprintf(stderr, "xtframe-view: --clock: expected seconds >= 0, got '%s'\n", v.c_str());
                 return false;
             }
         } else if (!arg.empty() && arg[0] == '-') {
@@ -1614,7 +1638,12 @@ void printUsage(std::FILE* out) {
         "                          \"<frame> #<id>.Click button=right\" clicks with that button\n"
         "                          (left|right|middle, default left);\n"
         "                          \"[<frame>] pointer <move|down|up> <x> <y> [button=<b>]\" pushes\n"
-        "                          one raw pointer event (button only with down/up)\n"
+        "                          one raw pointer event (button only with down/up);\n"
+        "                          \"[<frame>] wheel <dx> <dy> [<x> <y>]\" pushes one wheel event\n"
+        "                          (notches; without x y over the root element's centre);\n"
+        "                          \"[<frame>] channel <name> <value> [<strength>] [relative|button]\"\n"
+        "                          one input-channel value; \"[<frame>] axis <pad.rx> <value>\" one\n"
+        "                          gamepad axis; \"[<frame>] key down|up <name>\" one key edge\n"
         "  --port <name>=<value>   set a declared port before the first frame (repeatable;\n"
         "  --port <name> <value>   a list/struct port takes JSON: items='[{\"name\":\"A\"}]';\n"
         "                          a vec2/vec3 port x,y[,z] or pos=[1,2]; one pair of outer\n"
@@ -1663,6 +1692,9 @@ void printUsage(std::FILE* out) {
         "  --advance <seconds>     run the frames before that time without painting (updates\n"
         "                          only; --event/--pointer in them are sent), then paint\n"
         "                          --frames from there (--headless and --renderer runs)\n"
+        "  --clock <seconds>       start the clock at that time instead of 0, without stepping\n"
+        "                          to it (CSS animations and --play start there; xtTime is the\n"
+        "                          clock modulo 3600 s); with --advance, set first, then advanced\n"
         "  --device W:H            device aspect ratio for @media; viewport width = height x W/H\n"
         "  --safe F | T,R,B,L      safe-area insets as fractions of the viewport (0..0.5)\n"
         "  --platform KIND         desktop, console or handheld (@media (platform))\n"
@@ -1796,18 +1828,11 @@ struct GpuCounterTotals {
 /// agent can read it. Times are milliseconds; `render`/`effects`/`text` come from the backend and
 /// are CPU time (the GL backend never calls glFinish).
 /// `damageAreaPercent` < 0 means "damage was not computed this run", which hides that row.
-/// T-749 (--idle-skip): the dt that takes a clock at `from` to exactly `to` in the one float addition
-/// Context::update() makes, so a run that skipped idle frames goes on with the clock values of a run that
-/// did not. `to` >= `from`.
-float dtReaching(float from, float to) {
-    float dt = to - from;
-    for (int i = 0; i < 8; ++i) {
-        const float reached = from + dt;
-        if (reached == to) {
-            break;
-        }
-        dt = std::nextafter(dt, reached < to ? INFINITY : -INFINITY);
-    }
+/// T-749 (--idle-skip): the dt that takes a clock at `from` to `to` in the one addition Context::update()
+/// makes, so a run that skipped idle frames goes on with the clock values of a run that did not. `to` >=
+/// `from`. T-870: the clock is a double, so the float nearest the difference (within ~1e-9 s of it).
+float dtReaching(double from, double to) {
+    const float dt = static_cast<float>(to - from);  // The sum in double is exact; the nearest float.
     return dt < 0.0f ? 0.0f : dt;
 }
 
@@ -2927,6 +2952,9 @@ int main(int argc, char** argv) {
             args.bundle->registerImageMeta(assets);  // T-759: atlas cells, slices, @2x / @3x variants.
         }
         xt::Context ctx(xt::ContextConfig{&shaper, &assets});
+        if (args.clock >= 0.0) {
+            ctx.setClock(args.clock);  // T-870: before the documents load (their clock starts there).
+        }
         // T-191 (25.3.5b): no decoder here -- an unbound <video>/<external> shows its placeholder.
         ctx.setExternalPlaceholders(true);
         ctx.setBoxShadowCommands(!args.noBoxShadow);  // T-680
@@ -3104,7 +3132,7 @@ int main(int argc, char** argv) {
         // the clock a run that never skips would have (the dts added as Context::update() adds them).
         uint32_t idleSkipped = 0;
         bool skippedSinceUpdate = false;
-        float runClock = 0.0f;
+        double runClock = ctx.clockSeconds();  // T-870: --clock
         // T-817: --advance, the frames before the first painted one -- updated as a plain run updates
         // them (same dts, scripted input and flow ticks), never rendered.
         const AdvancePlan advance = planAdvance(windowLoop ? 0.0f : args.advance, dt);
@@ -3138,7 +3166,7 @@ int main(int argc, char** argv) {
                 }
             }
             ctx.perf().setEnabled(args.perf);
-            runClock = ctx.clock();
+            runClock = ctx.clockSeconds();
         }
         const uint32_t firstFrame = advance.firstFrame;
         const uint32_t endFrame =
@@ -3165,7 +3193,7 @@ int main(int argc, char** argv) {
             if (args.idleSkip) {
                 // T-749: this frame's scripted input first -- it wakes the Context.
                 applyScriptedInput(args, ctx, handle, frame, systemEvent);
-                runClock += frameDt;
+                runClock += static_cast<double>(frameDt);
                 const bool lastShot = windowLoop && !args.screenshot.empty() && frame + 1 == endFrame;
                 if (frame > firstFrame && !lastShot && !ctx.needsFrame() &&
                     !(hasFlow && flowRuntime.needsTick())) {
@@ -3174,7 +3202,8 @@ int main(int argc, char** argv) {
                     continue;
                 }
                 if (skippedSinceUpdate) {
-                    frameDt = dtReaching(ctx.clock(), runClock);  // The time skipped, to the same clock.
+                    // The time skipped, to the same clock.
+                    frameDt = dtReaching(ctx.clockSeconds(), runClock);
                     skippedSinceUpdate = false;
                 }
                 ctx.perf().markFrameStart();
@@ -3455,6 +3484,9 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    if (args.clock >= 0.0) {
+        app.context().setClock(args.clock);  // T-870: before the documents load.
+    }
     // T-193: --project's other UIs first, so the main UI stays the foreground Document.
     FlowTargets targets;
     if (!loadOtherUis(args, app.context(), rootDir, targets)) {
@@ -3642,7 +3674,7 @@ int main(int argc, char** argv) {
                     for (xt::ElementRef anim : animatedElements(*doc)) {
                         uint32_t id = doc->defaultAnimation(anim);
                         float frameRate = frameRateFor(*doc, anim);
-                        float localT = doc->animator().localTime(id, app.context().clock());
+                        float localT = doc->animator().localTime(id, app.context().clockSeconds());
                         doc->seek(id, localT + sign / frameRate);
                     }
                     break;

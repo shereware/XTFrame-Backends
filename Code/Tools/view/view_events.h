@@ -18,6 +18,7 @@
 #include "xt/document.h"
 #include "xt/flow/flow_runtime.h"
 #include "xt/input.h"
+#include "xt/input_channels.h"
 
 namespace xt::tools::view {
 
@@ -41,6 +42,14 @@ struct ScriptedEvent {
     float x = 0;                                              ///< T-627 `Pointer`: viewport x.
     float y = 0;                                              ///< T-627 `Pointer`: viewport y.
     xt::InputEvent::Kind kind = xt::InputEvent::PointerMove;  ///< T-627 `Pointer`: move / down / up.
+    float wheelX = 0;                                         ///< T-871 `Wheel`: the horizontal notches.
+    float wheelY = 0;     ///< T-871 `Wheel`: the vertical notches (positive scrolls down).
+    bool hasPos = false;  ///< T-871 `Wheel`: x / y were given (else the root element's centre).
+    // T-873 (60 §60.7): `Channel` (id = the canonical channel name), `Axis` (id = pad.<axis>),
+    // `KeyDown` / `KeyUp` (key = the KeyCode).
+    float channelValue = 0;     ///< `Channel` / `Axis`: the value.
+    float channelStrength = 1;  ///< `Channel`: the strength.
+    uint8_t channelFlags = 0;   ///< `Channel`: kChannelRelative / kChannelButton.
 };
 
 /// T-194: `--event "... press <button>"` button names -> GamepadButton.
@@ -206,6 +215,84 @@ inline bool parseEventSpec(const std::string& spec, ScriptedEvent& out) {
             out.port = "Pointer";
             out.kind = kind;
             out.button = button;
+            return true;
+        }
+        // T-871 (60 §60.7): `[<frame>] wheel <dx> <dy> [<x> <y>]`, notches (positive y scrolls
+        // down); without a position the wheel turns over the root element's centre.
+        if (parts.size() > at && parts[at] == "wheel") {
+            if ((parts.size() != at + 3 && parts.size() != at + 5) ||
+                !parseCoordinate(parts[at + 1], out.wheelX) || !parseCoordinate(parts[at + 2], out.wheelY) ||
+                (parts.size() == at + 5 &&
+                 (!parseCoordinate(parts[at + 3], out.x) || !parseCoordinate(parts[at + 4], out.y)))) {
+                eventSpecError(spec, "a wheel event is \"[<frame>] wheel <dx> <dy> [<x> <y>]\" (notches)");
+                return false;
+            }
+            out.frame = frame;
+            out.port = "Wheel";
+            out.hasPos = parts.size() == at + 5;
+            return true;
+        }
+        // T-873 (60 §60.7): `[<frame>] channel <name> <value> [<strength>] [relative|button]`, one
+        // value of an input channel (a `player(<n>).` prefix picks the player).
+        if (parts.size() > at && parts[at] == "channel") {
+            std::string canonical;
+            std::string why;
+            size_t end = parts.size();
+            if (end > at + 3 && (parts[end - 1] == "relative" || parts[end - 1] == "button")) {
+                out.channelFlags = parts[end - 1] == "relative" ? xt::kChannelRelative : xt::kChannelButton;
+                --end;
+            }
+            if (end < at + 3 || end > at + 4 ||
+                !xt::parseChannelRef(parts[at + 1], canonical, out.player, &why) ||
+                !parseCoordinate(parts[at + 2], out.channelValue) ||
+                (end == at + 4 && !parseCoordinate(parts[at + 3], out.channelStrength))) {
+                eventSpecError(spec, (why.empty() ? std::string() : why + "; ") +
+                                         "a channel value is \"[<frame>] channel <name> <value> [<strength>] "
+                                         "[relative|button]\"");
+                return false;
+            }
+            out.frame = frame;
+            out.port = "Channel";
+            out.id = canonical;
+            return true;
+        }
+        // T-873: `[<frame>] axis <pad.lx|ly|rx|ry|lt|rt> <value>`, one gamepad axis motion (through the
+        // existing event: navigation as before, and the pad.* channel).
+        if (parts.size() > at && parts[at] == "axis") {
+            std::string canonical;
+            static const char* const kAxes[] = {"pad.lx", "pad.ly", "pad.rx", "pad.ry", "pad.lt", "pad.rt"};
+            int axis = -1;
+            if (parts.size() == at + 3 && xt::parseChannelRef(parts[at + 1], canonical, out.player)) {
+                for (int i = 0; i < 6; ++i) {
+                    axis = canonical == kAxes[i] ? i : axis;
+                }
+            }
+            if (axis < 0 || !parseCoordinate(parts[at + 2], out.channelValue)) {
+                eventSpecError(spec,
+                               "a gamepad axis is \"[<frame>] axis <pad.lx|ly|rx|ry|lt|rt> <value>\" "
+                               "(player(<n>). prefix allowed)");
+                return false;
+            }
+            out.frame = frame;
+            out.port = "Axis";
+            out.id = canonical;
+            out.key = static_cast<uint32_t>(axis);
+            return true;
+        }
+        // T-873: `[<frame>] key down|up <name>`, one key-down or key-up alone.
+        if (parts.size() > at + 1 && parts[at] == "key" &&
+            (parts[at + 1] == "down" || parts[at + 1] == "up")) {
+            uint32_t key = 0;
+            if (parts.size() != at + 3 || !xt::compile::keyCodeFromTriggerName(parts[at + 2], key) ||
+                key == xt::kTriggerKeyAny) {
+                eventSpecError(spec,
+                               "a key edge is \"[<frame>] key down|up <name>\" with a key() trigger name");
+                return false;
+            }
+            out.frame = frame;
+            out.port = parts[at + 1] == "down" ? "KeyDown" : "KeyUp";
+            out.id = parts[at + 2];
+            out.key = key;
             return true;
         }
         // T-571 (08 §8.20): `[<frame>] key <name>`, the names of the `key()` trigger.
@@ -399,6 +486,49 @@ inline void applyScriptedEvent(xt::Context& ctx, xt::Document& doc, const Script
     if (scripted.port == "Pointer") {
         // T-627: one raw pointer event with its button, as --pointer.
         pushPointer(ctx, scripted.kind, xt::Vec2{scripted.x, scripted.y}, scripted.button);
+        return;
+    }
+    if (scripted.port == "Wheel") {
+        // T-871 (60 §60.7): one raw wheel event through the input queue, as a mouse wheel would.
+        xt::InputEvent ev;
+        ev.kind = xt::InputEvent::Wheel;
+        ev.wheelDelta = xt::Vec2{scripted.wheelX, scripted.wheelY};
+        ev.pos = xt::Vec2{scripted.x, scripted.y};
+        if (!scripted.hasPos) {
+            const xt::Rect box = doc.root().boundingBox();
+            ev.pos = xt::Vec2{box.x + box.w * 0.5f, box.y + box.h * 0.5f};
+        }
+        ctx.pushInput(ev);
+        return;
+    }
+    if (scripted.port == "Channel") {
+        // T-873 (60 §60.7): one channel value through the input queue, as a host would push it.
+        xt::InputEvent ev;
+        ev.kind = xt::InputEvent::Channel;
+        ev.channel = ctx.inputChannel(scripted.id);
+        ev.channelValue = scripted.channelValue;
+        ev.channelStrength = scripted.channelStrength;
+        ev.channelFlags = scripted.channelFlags;
+        ev.player = scripted.player;
+        ctx.pushInput(ev);
+        return;
+    }
+    if (scripted.port == "Axis") {
+        // T-873: one gamepad axis motion of one local player.
+        xt::InputEvent ev;
+        ev.kind = xt::InputEvent::GamepadAxisMotion;
+        ev.gamepadAxis = static_cast<xt::GamepadAxis>(scripted.key);
+        ev.axisValue = scripted.channelValue;
+        ev.player = scripted.player;
+        ctx.pushInput(ev);
+        return;
+    }
+    if (scripted.port == "KeyDown" || scripted.port == "KeyUp") {
+        // T-873: a key-down or a key-up alone.
+        xt::InputEvent ev;
+        ev.kind = scripted.port == "KeyDown" ? xt::InputEvent::KeyDown : xt::InputEvent::KeyUp;
+        ev.key = static_cast<xt::KeyCode>(scripted.key);
+        ctx.pushInput(ev);
         return;
     }
     if (scripted.port == "Key") {

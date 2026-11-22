@@ -1713,6 +1713,125 @@ TEST_CASE("gl: T-263d two documents in one frame each run their own custom effec
     std::filesystem::remove_all(dir, ec);
 }
 
+// T-870 (59 §59.7 item 2): `xtTime` is the Context clock modulo 3600 s, end to end (Context ->
+// CommandList::time -> the GL wrapper's uniform). The shader writes xtTime / 8 into red.
+TEST_CASE("gl: T-870 xtTime is the clock modulo 3600 s") {
+    constexpr int kW = 32;
+    constexpr int kH = 32;
+    const std::filesystem::path dir = xt::test::tempDir() / "xt_t870_xttime_gl";
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::filesystem::create_directories(dir, ec);
+    {
+        std::ofstream f(dir / "fx.xtfx", std::ios::binary);
+        f << "fallback: none\n---\nfloat4 xtMain(XtInput i)\n{\n"
+             "    return float4(saturate(xtTime / 8.0), 0, 0, xtSample(i.uv).a);\n}\n";
+    }
+    const std::string xt =
+        "<xt><head><style>#a { position: absolute; left: 0px; top: 0px; width: 32px; height: 32px;"
+        " background-color: #ffffff; effect: custom(\"fx.xtfx\"); }</style></head>"
+        "<body style=\"padding: 0\"><div id=\"a\"></div></body></xt>";
+    compile::SourceFile file{"doc.xt", xt};
+    compile::CompileOptions options;
+    options.rootDir = dir.string();
+    const std::vector<uint8_t> ir =
+        compile::compileDocumentFromStrings(std::span<const compile::SourceFile>(&file, 1), "doc.xt", options)
+            .ir;
+    REQUIRE(!ir.empty());
+    {
+        FileAssetResolver assets(dir.string(), sw::decodeImageBytes);
+        Context ctx(ContextConfig{nullptr, &assets});
+        ctx.setViewport(Rect{0, 0, static_cast<float>(kW), static_cast<float>(kH)}, 1.0f);
+        Result<DocumentHandle> handle = ctx.loadDocument(IrBlob{ir.data(), ir.size()}, false);
+        REQUIRE(handle.ok());
+        const Document* doc = ctx.document(handle.value());
+        CommandList list;
+        auto redAt = [&](double clock) {
+            ctx.setClock(clock);
+            ctx.update(0.0f);
+            ctx.render(list);
+            CAPTURE(clock);
+            CHECK(list.time == static_cast<float>(std::fmod(clock, 3600.0)));
+            const std::vector<uint8_t> px =
+                renderCommands(list, kW, kH, Color{0, 0, 0, 1}, &assets, &doc->ir());
+            return static_cast<int>(pixelAt(px, kW, kH, 16, 16).r);
+        };
+        CHECK(std::abs(redAt(4.0) - 128) <= 2);      // 4 / 8
+        CHECK(std::abs(redAt(3602.0) - 64) <= 2);    // (3602 mod 3600) / 8
+        CHECK(std::abs(redAt(36006.0) - 191) <= 2);  // (36006 mod 3600) / 8
+    }
+    std::filesystem::remove_all(dir, ec);
+}
+
+// T-874 (59 §59.7 item 2): each custom effect wraps `xtTime` at its own `.xtfx` `time:` period, end to
+// end through the GL wrapper. Red = xtTime / 16, green = xtTime - 7200 (both clamped to 0..1).
+TEST_CASE("gl: T-874 xtTime follows each effect's time: header") {
+    constexpr int kW = 64;
+    constexpr int kH = 24;
+    const std::filesystem::path dir = xt::test::tempDir() / "xt_t874_xttime_gl";
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::filesystem::create_directories(dir, ec);
+    const char* const files[3] = {"u.xtfx", "t.xtfx", "d.xtfx"};
+    const char* const headers[3] = {"time: unbounded\n", "time: 10\n", ""};
+    std::string style;
+    std::string body;
+    for (int i = 0; i < 3; ++i) {
+        std::ofstream f(dir / files[i], std::ios::binary);
+        f << "fallback: none\n"
+          << headers[i]
+          << "---\nfloat4 xtMain(XtInput i)\n{\n"
+             "    return float4(saturate(xtTime / 16.0), saturate(xtTime - 7200.0), 0, "
+             "xtSample(i.uv).a);\n}\n";
+        const std::string id(1, static_cast<char>('a' + i));
+        style += "#" + id + " { position: absolute; left: " + std::to_string(20 * i) +
+                 "px; top: 4px; width: 16px; height: 16px; background-color: #ffffff; effect: custom(\"" +
+                 files[i] + "\"); }";
+        body += "<div id=\"" + id + "\"></div>";
+    }
+    const std::string xt =
+        "<xt><head><style>" + style + "</style></head><body style=\"padding: 0\">" + body + "</body></xt>";
+    compile::SourceFile file{"doc.xt", xt};
+    compile::CompileOptions options;
+    options.rootDir = dir.string();
+    const std::vector<uint8_t> ir =
+        compile::compileDocumentFromStrings(std::span<const compile::SourceFile>(&file, 1), "doc.xt", options)
+            .ir;
+    REQUIRE(!ir.empty());
+    {
+        FileAssetResolver assets(dir.string(), sw::decodeImageBytes);
+        Context ctx(ContextConfig{nullptr, &assets});
+        ctx.setViewport(Rect{0, 0, static_cast<float>(kW), static_cast<float>(kH)}, 1.0f);
+        Result<DocumentHandle> handle = ctx.loadDocument(IrBlob{ir.data(), ir.size()}, false);
+        REQUIRE(handle.ok());
+        const Document* doc = ctx.document(handle.value());
+        CommandList list;
+        auto render = [&](double clock) {
+            ctx.setClock(clock);
+            ctx.update(0.0f);
+            ctx.render(list);
+            return renderCommands(list, kW, kH, Color{0, 0, 0, 1}, &assets, &doc->ir());
+        };
+        auto near = [](int value, int expected) { return std::abs(value - expected) <= 2; };
+        std::vector<uint8_t> px = render(7200.5);
+        // unbounded: 7200.5
+        CHECK(near(pixelAt(px, kW, kH, 8, 12).r, 255));
+        CHECK(near(pixelAt(px, kW, kH, 8, 12).g, 128));
+        // time: 10 and the default: 0.5
+        CHECK(near(pixelAt(px, kW, kH, 28, 12).r, 8));
+        CHECK(near(pixelAt(px, kW, kH, 28, 12).g, 0));
+        CHECK(near(pixelAt(px, kW, kH, 48, 12).r, 8));
+        CHECK(near(pixelAt(px, kW, kH, 48, 12).g, 0));
+        px = render(7212.5);
+        CHECK(near(pixelAt(px, kW, kH, 8, 12).r, 255));  // 7212.5
+        CHECK(near(pixelAt(px, kW, kH, 8, 12).g, 255));
+        CHECK(near(pixelAt(px, kW, kH, 28, 12).r, 40));   // 2.5
+        CHECK(near(pixelAt(px, kW, kH, 48, 12).r, 199));  // 12.5
+        CHECK(near(pixelAt(px, kW, kH, 48, 12).g, 0));
+    }
+    std::filesystem::remove_all(dir, ec);
+}
+
 // =================================================================================================
 // T-263c ruling 7: a host's sampler objects on units 0..2 would override every texture parameter
 // xt_gl sets; they are unbound for the render and bound again afterwards.
