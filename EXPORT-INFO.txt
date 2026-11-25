@@ -1,7 +1,7 @@
 XTFrame backends export (Tools/Scripts/export_backends.sh)
-source-commit: e45386f9830ee73a5ca531c4f224a2484af20de4
-source-short: e45386f9830e
-source-date: 2026-11-22
-version: 0.20.0
-files: 175 exported + 9 generated
-submodule: runtime 7cb1ec10ae1082eaa2d878c99b61b6d27d3321fa
+source-commit: e6899ba78bacb3740f1c609b3a5ac0b1932523de
+source-short: e6899ba78bac
+source-date: 2026-11-26
+version: 0.21.0
+files: 177 exported + 9 generated
+submodule: runtime 8731c59d4ab8a1611e986f0a979cf8a9434866dc

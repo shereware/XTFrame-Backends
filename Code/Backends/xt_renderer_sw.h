@@ -40,6 +40,8 @@ public:
     int stride() const { return m_width * 4; }
     /// True when the last render changed pixels (cleared by takeDirty()).
     bool takeDirty();
+    /// T-882: the renderer itself (e.g. SwRenderer::setEffectReport), as RendererGl3::renderer().
+    xt::sw::SwRenderer& renderer() { return m_renderer; }
 
 private:
     xt::sw::SwRenderer m_renderer;

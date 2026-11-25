@@ -28,7 +28,10 @@ constexpr uint32_t kMaxParams = 20;  // 16 float slots + 4 colors at most (custo
 constexpr uint32_t kLocalBase = kParamBase + 4 * kMaxParams;
 static_assert(kLocalBase + 8 <= kParamBlockBytes / sizeof(float), "custom block overflows");
 
-std::string wrapModule(std::string_view module, const char* names, const uint8_t* types, uint32_t count) {
+}  // namespace
+
+std::string wrapCustomModule(std::string_view module, const char* names, const uint8_t* types,
+                             uint32_t count) {
     std::string src =
         "#version 450\n"
         "layout(location = 0) in vec2 vUV;\n"
@@ -88,6 +91,8 @@ std::string wrapModule(std::string_view module, const char* names, const uint8_t
     return src;
 }
 
+namespace {
+
 /// gl_shaders.h kQuadVert in Vulkan-style GLSL (set 0 = this device's pass constants), without its v
 /// flip: wgpu validates the stage interface by interpolation, and a WGSL output (perspective,
 /// center) does not match the sampling-less input Naga makes of a GLSL input.
@@ -116,6 +121,27 @@ WGPUShaderModule glslModule(WGPUDevice device, const std::string& code, WGPUShad
     return wgpuDeviceCreateShaderModule(device, &d);
 }
 
+/// T-892: the frontend's own message out of a wgpu error -- wgpu-native frames it as
+/// "Validation Error", "Caused by:" and "In wgpuDeviceCreateShaderModule, ..." lines before the
+/// frontend's error; those lines are dropped so the message's first line is the error itself.
+std::string compileMessage(const std::string& err) {
+    size_t pos = 0;
+    while (pos < err.size()) {
+        size_t end = err.find('\n', pos);
+        if (end == std::string::npos) end = err.size();
+        std::string_view line(err.data() + pos, end - pos);
+        while (!line.empty() && (line.front() == ' ' || line.front() == '\t')) line.remove_prefix(1);
+        while (!line.empty() && (line.back() == ' ' || line.back() == '\r')) line.remove_suffix(1);
+        const bool framing = line.empty() || line == "Validation Error" || line == "Caused by:" ||
+                             line.rfind("In wgpu", 0) == 0 || line.rfind("In Device::", 0) == 0;
+        if (!framing) {
+            return err.substr(pos);
+        }
+        pos = end + 1;
+    }
+    return err;
+}
+
 }  // namespace
 
 uint32_t Pipelines::prepareCustom(std::string_view glsl, const char* names, const uint8_t* types,
@@ -133,7 +159,7 @@ uint32_t Pipelines::prepareCustom(std::string_view glsl, const char* names, cons
     if (count > kMaxParams || !customParamSlots(c.types.data(), count, c.slots.data())) {
         err = "too many parameters";
     } else {
-        const std::string code = wrapModule(glsl, names, types, count);
+        const std::string code = wrapCustomModule(glsl, names, types, count);
         pushCreationScopes(m_device);
         if (m_customVertex == nullptr) {
             m_customVertex = glslModule(m_device, kCustomVertex, WGPUShaderStage_Vertex);
@@ -167,9 +193,19 @@ uint32_t Pipelines::prepareCustom(std::string_view glsl, const char* names, cons
     const bool ok = c.module != nullptr;
     if (!ok) {
         warning = "custom effect shader failed to compile; its fallback is applied instead: " + err;
+        c.failure = compileMessage(err);
     }
     m_custom.push_back(std::move(c));
     return ok ? static_cast<uint32_t>(m_custom.size()) : 0;
+}
+
+std::string Pipelines::customFailure(std::string_view glsl) const {
+    for (const Custom& c : m_custom) {
+        if (c.glsl == glsl) {
+            return c.module == nullptr ? c.failure : std::string();
+        }
+    }
+    return std::string();
 }
 
 bool Pipelines::packCustom(const float* params, size_t available, float* out, uint16_t& shader) const {
@@ -218,3 +254,12 @@ bool Pipelines::packCustom(const float* params, size_t available, float* out, ui
 }
 
 }  // namespace xt::wgpu::detail
+
+namespace xt::wgpu {
+
+// T-892 (here rather than in wgpu_device.cpp, next to the failure it reads).
+std::string WgpuDevice::customEffectFailure(std::string_view glsl) const {
+    return m_gpu ? m_gpu->pipelines->customFailure(glsl) : std::string();
+}
+
+}  // namespace xt::wgpu

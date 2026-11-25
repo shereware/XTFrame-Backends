@@ -12,11 +12,13 @@
 
 #include "doctest.h"
 #include "test_wgpu_draw_util.h"
+#include "wgpu_internal.h"  // detail::wrapCustomModule (T-892; Code/Runtime/wgpu/src)
 #include "xt/compile/compile.h"
 #include "xt/compile/xtfx.h"
 #include "xt/document.h"
 #include "xt/perf.h"
 #include "xt/sw/sw_png.h"
+#include "xt/xtfx_reserved.h"
 
 using namespace xt;
 using namespace xt::wgpu::test;
@@ -333,6 +335,60 @@ TEST_CASE("wgpu custom: a shader that fails to compile warns once and applies it
     CHECK(matches(second, renderSw(cl, 64, 64), 64, 64, "custom fallback"));
     golden::GoldenResult same = golden::compareRgba(first.data(), second.data(), 64, 64, 0, 0.0f);
     CHECK(same.pass);
+}
+
+// T-892 (18 §18.7, 59 §59.4): the wgpu wrapper only adds listed `xt` names (xt/xtfx_reserved.h), and
+// a module the GLSL frontend rejects reports the first line of its message in the effect report.
+
+TEST_CASE("wgpu custom: T-892 every xt name of the wrapper is in the reserved list") {
+    const std::string module = glslOf(
+        "param k float 1\nparam tint color #fff\nparam off vec2 0 0\n---\n"
+        "float4 xtMain(XtInput i) { return xtSample(i.uv + off + fmod(i.local, i.boxSize)) * tint * k * "
+        "xtTime; }\n");
+    const char names[] = "k\0tint\0off\0";
+    const uint8_t types[] = {0, 2, 1};
+    const std::string wrapped = xt::wgpu::detail::wrapCustomModule(module, names, types, 3);
+    const std::vector<std::string> unlisted = xtfxUnlistedWrapperNames(wrapped);
+    CHECK_MESSAGE(unlisted.empty(), (unlisted.empty() ? std::string() : unlisted.front()) << "\n" << wrapped);
+    // The three names T-889 found: the module compiled with them as parameters and fell back.
+    for (const char* name : {"xtU", "xtLayerTex", "xtLayerSmp"}) {
+        CHECK(wrapped.find(name) != std::string::npos);
+        CHECK(isXtfxWrapperName(name));
+    }
+}
+
+TEST_CASE("wgpu custom: T-892 a shader the GLSL frontend rejects reports its message in the effect report") {
+    // A valid body's translation with a vec4 assigned to a vec3 put in (a bad translation result).
+    std::string glsl = glslOf("---\nfloat4 xtMain(XtInput i) { return xtSample(i.uv); }\n");
+    const std::string ret = "    return xtSample(i.uv);\n";
+    const size_t at = glsl.find(ret);
+    REQUIRE(at != std::string::npos);
+    glsl.insert(at, "    vec3 bad = vec4(1.0, 1.0, 1.0, 1.0);\n");
+    CommandList cl = makeList(64, 64);
+    addShader(cl, 1, glsl, {}, {}, effect(EffectKind::Blur, {4, 4}));
+    addPushEffect(cl, {customFx(1, {})}, Rect{0, 0, 64, 64}, Rect{16, 16, 32, 32});
+    addFillRect(cl, 16, 16, 32, 32, Color{1, 0.5f, 0, 1});
+    addPopEffect(cl);
+    Session s(64, 64);
+    std::vector<gpu::FrameBuilder::EffectReport> reports;
+    s.renderer.setEffectReport(&reports);
+    s.render(cl);
+    REQUIRE(reports.size() == 1);
+    CHECK_FALSE(reports[0].executed);
+    CHECK(reports[0].drawnInstead == EffectKind::Blur);
+    const std::string failure = reports[0].failure;
+    REQUIRE_FALSE(failure.empty());
+    CHECK(s.warning.find(failure.substr(0, failure.find('\n'))) != std::string::npos);
+    const std::string reason = gpu::FrameBuilder::effectFailureReason("wgpu", failure);
+    MESSAGE("wgpu reason: " << reason);
+    CHECK(reason.rfind("shader failed to compile on wgpu: ", 0) == 0);
+    CHECK(reason.find('\n') == std::string::npos);
+    // Cached with its message: the next frame reports the same text and warns no more.
+    s.render(cl);
+    CHECK(s.warning.empty());
+    REQUIRE(reports.size() == 1);
+    CHECK(reports[0].failure == failure);
+    s.renderer.setEffectReport(nullptr);
 }
 
 // T-818 (Docs/design/18-effects.md §18.7.x): XtInput.local follows the node's transform, XtInput.uv

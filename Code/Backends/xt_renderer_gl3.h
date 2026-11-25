@@ -67,6 +67,7 @@ public:
     int height() const { return m_height; }
     const char* lastError() const { return m_error.c_str(); }
     xt::gl::GlRenderer& renderer() { return m_renderer; }
+    const xt::gl::GlRenderer& renderer() const { return m_renderer; }  // T-882
 
 private:
     struct Gl;  // the loaded entry points

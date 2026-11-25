@@ -274,8 +274,6 @@ bool EffectPrograms::bind(gpu::EffectProgram program, const float* params, size_
 // T-203: custom effects.
 // -------------------------------------------------------------------------------------------
 
-namespace {
-
 /// Wraps an `.xtfx` GLSL module into a complete fragment shader (Docs/design/18-effects.md §18.7's
 /// fixed interface). `xtTexCoord` maps the top-down `XtInput.uv` convention onto the bottom-up FBO
 /// texture (kQuadVert's `vUV`); the layer is premultiplied, `xtSample` (in the module)
@@ -313,8 +311,6 @@ std::string wrapCustomModule(std::string_view module) {
         "}\n";
     return src;
 }
-
-}  // namespace
 
 uint32_t CustomEffectPrograms::prepare(std::string_view glsl, const char* names, const uint8_t* types,
                                        uint32_t count, std::string& warning) {
@@ -358,9 +354,19 @@ uint32_t CustomEffectPrograms::prepare(std::string_view glsl, const char* names,
     e.id = prog;
     if (prog == 0) {
         warning = "custom effect shader failed to compile; its fallback is applied instead: " + err;
+        e.failure = err;
     }
     m_entries.push_back(std::move(e));
     return prog != 0 ? static_cast<uint32_t>(m_entries.size()) : 0;
+}
+
+std::string CustomEffectPrograms::failure(std::string_view glsl) const {
+    for (const Entry& e : m_entries) {
+        if (e.glsl == glsl) {
+            return e.id == 0 ? e.failure : std::string();
+        }
+    }
+    return std::string();
 }
 
 bool CustomEffectPrograms::bind(const float* params, size_t available, GLuint srcTex, const float* ndc9,

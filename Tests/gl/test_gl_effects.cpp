@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "doctest.h"
+#include "gl_effects.h"  // wrapCustomModule (T-892; Code/Runtime/gl/src)
 #include "gl_loader.h"
 #include "golden_common.h"
 #include "xt/asset_resolver.h"
@@ -23,6 +24,7 @@
 #include "xt/sw/sw_renderer.h"
 #include "xt/text_shaper.h"
 #include "xt/types.h"
+#include "xt/xtfx_reserved.h"
 
 /// GlRenderer PushEffect/PopEffect GL-vs-SW cross-check (Docs/tasks/T-54.md "測試"): the same ten
 /// CommandLists Tests/unit/test_sw_effects.cpp exercises, rendered through both xt::gl::GlRenderer
@@ -1452,6 +1454,76 @@ TEST_CASE("gl custom: a failed shader with fallback none leaves the content as d
     std::vector<uint8_t> b = gl.render(plain);
     golden::GoldenResult r = golden::compareRgba(a.data(), b.data(), 64, 64, 2, 0.0f);
     CHECK(r.pass);
+}
+
+// T-892 (18 §18.7, 59 §59.4): the GL wrapper only adds listed `xt` names (xt/xtfx_reserved.h), and a
+// module the GLSL compiler rejects reports the first line of its info log in the effect report.
+
+TEST_CASE("gl custom: T-892 every xt name of the wrapper is in the reserved list") {
+    const char* const withLocal =
+        "param k float 1\nparam tint color #fff\n---\n"
+        "float4 xtMain(XtInput i) { return xtSample(i.uv + fmod(i.local, i.boxSize)) * tint * k * xtTime; "
+        "}\n";
+    for (const std::string& module : {glslOf(withLocal), glslOf(kRippleXtfx)}) {
+        const std::string wrapped = gl::wrapCustomModule(module);
+        const std::vector<std::string> unlisted = xtfxUnlistedWrapperNames(wrapped);
+        CHECK_MESSAGE(unlisted.empty(), (unlisted.empty() ? std::string() : unlisted.front()) << "\n"
+                                                                                              << wrapped);
+    }
+    // A module translated before T-818 (no local / boxSize) is wrapped without xtPx / xtLocalRow*.
+    std::string old = glslOf(kRippleXtfx);
+    const std::string newStruct =
+        "struct XtInput { vec2 uv; vec2 texelSize; vec2 layerSize; vec2 local; vec2 boxSize; };";
+    const size_t at = old.find(newStruct);
+    REQUIRE(at != std::string::npos);
+    old.replace(at, newStruct.size(), "struct XtInput { vec2 uv; vec2 texelSize; vec2 layerSize; };");
+    CHECK(xtfxUnlistedWrapperNames(gl::wrapCustomModule(old)).empty());
+    // kQuadVert's uniform links with the module: reserved too.
+    CHECK(isXtfxWrapperName("uNdc"));
+}
+
+namespace {
+
+/// A translated module the device rejects although the `.xtfx` passed: the translation of a valid
+/// body with a vec4 assigned to a vec3 put in (a bad translation result, as T-892's sheet allows).
+std::string brokenModule() {
+    std::string glsl = glslOf("---\nfloat4 xtMain(XtInput i) { return xtSample(i.uv); }\n");
+    const std::string ret = "    return xtSample(i.uv);\n";
+    const size_t at = glsl.find(ret);
+    REQUIRE(at != std::string::npos);
+    glsl.insert(at, "    vec3 bad = vec4(1.0, 1.0, 1.0, 1.0);\n");
+    return glsl;
+}
+
+}  // namespace
+
+TEST_CASE("gl custom: T-892 a shader the GLSL compiler rejects reports its message in the effect report") {
+    CommandList cl = makeList();
+    addShader(cl, 1, brokenModule(), {}, {}, blurFx(4, 4));
+    addPushEffect(cl, {customFx(1, {})}, Mat2x3{}, Rect{0, 0, 64, 64}, Rect{16, 16, 32, 32});
+    addFillRect(cl, 16, 16, 32, 32, Color{1, 0.5f, 0, 1});
+    addPopEffect(cl);
+    GlSession gl(64, 64);
+    std::vector<gpu::FrameBuilder::EffectReport> reports;
+    gl.renderer.setEffectReport(&reports);
+    gl.render(cl);
+    const std::string warning = gl.renderer.lastWarning();
+    REQUIRE(reports.size() == 1);
+    CHECK_FALSE(reports[0].executed);
+    CHECK(reports[0].drawnInstead == EffectKind::Blur);
+    const std::string failure = reports[0].failure;
+    REQUIRE_FALSE(failure.empty());
+    CHECK(warning.find(failure.substr(0, failure.find('\n'))) != std::string::npos);
+    const std::string reason = gpu::FrameBuilder::effectFailureReason("gl", failure);
+    MESSAGE("gl reason: " << reason);
+    CHECK(reason.rfind("shader failed to compile on gl: ", 0) == 0);
+    CHECK(reason.find('\n') == std::string::npos);
+    // The failure is cached with its message: the next frame reports the same text, no new warning.
+    gl.render(cl);
+    CHECK(std::string(gl.renderer.lastWarning()).empty());
+    REQUIRE(reports.size() == 1);
+    CHECK(reports[0].failure == failure);
+    gl.renderer.setEffectReport(nullptr);
 }
 
 // T-818 (Docs/design/18-effects.md §18.7.x): XtInput.local follows the node's transform, XtInput.uv

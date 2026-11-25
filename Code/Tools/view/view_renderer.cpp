@@ -1,6 +1,7 @@
 #include "view_renderer.h"
 
 #include <cstdio>
+#include <utility>
 
 #include "xt/gpu/gpu_frame.h"
 #include "xt_platform_sdl2.h"
@@ -131,6 +132,9 @@ public:
         m_renderer.setClearColor(config.clear);
         return true;
     }
+    void setEventHook(std::function<bool(const SDL_Event&, Context&)> hook) override {  // T-884
+        m_platform.setEventHook(std::move(hook));
+    }
     bool windowed() const override { return true; }
     bool pump(Context& context) override {
         const bool open = m_platform.pumpEvents(context);
@@ -164,6 +168,12 @@ public:
     void setTextShaper(text::FtTextShaper*) override {}
 #endif
     std::string description() const override { return "sw (sdl2 window)"; }
+    bool setEffectReport(std::vector<sw::SwEffectReport>* sw,
+                         std::vector<gpu::FrameBuilder::EffectReport>*) override {  // T-882
+        m_renderer.renderer().setEffectReport(sw);
+        return true;
+    }
+    std::string backendName() const override { return "xt_sw"; }
 
 private:
     backend::PlatformSdl2 m_platform;
@@ -188,6 +198,9 @@ public:
         }
         m_renderer.setClearColor(config.clear);
         return true;
+    }
+    void setEventHook(std::function<bool(const SDL_Event&, Context&)> hook) override {  // T-884
+        m_platform.setEventHook(std::move(hook));
     }
     bool windowed() const override { return m_windowed; }
     bool pump(Context& context) override {
@@ -236,6 +249,12 @@ public:
     std::string description() const override {
         return m_windowed ? "gl (sdl2 window)" : "gl (offscreen FBO)";
     }
+    bool setEffectReport(std::vector<sw::SwEffectReport>*,
+                         std::vector<gpu::FrameBuilder::EffectReport>* gpu) override {  // T-882
+        m_renderer.renderer().setEffectReport(gpu);
+        return true;
+    }
+    std::string backendName() const override { return m_renderer.renderer().deviceName(); }
     ~GlTarget() override {
         m_platform.glMakeCurrent();
         m_layers.end();  // before the renderer (its device) goes
@@ -324,6 +343,9 @@ public:
         m_clear = config.clear;
         return true;
     }
+    void setEventHook(std::function<bool(const SDL_Event&, Context&)> hook) override {  // T-884
+        m_platform.setEventHook(std::move(hook));
+    }
     bool windowed() const override { return m_windowed; }
     bool pump(Context& context) override {
         if (!m_windowed) return true;
@@ -369,6 +391,12 @@ public:
                m_renderer.adapterName() + (xt::wgpu::labelsEnabled() ? ", labels on" : ", labels off") +
                ")";  // T-726: XT_WGPU_LABELS
     }
+    bool setEffectReport(std::vector<sw::SwEffectReport>*,
+                         std::vector<gpu::FrameBuilder::EffectReport>* gpu) override {  // T-882
+        m_renderer.renderer().setEffectReport(gpu);
+        return true;
+    }
+    std::string backendName() const override { return m_renderer.adapterName(); }
     ~WgpuTarget() override { m_layers.end(); }  // before the renderer (its device) goes
     bool supportsLayers() const override { return true; }
     bool renderLayers(const CommandList& list, TextShaper* shaper, AssetResolver* assets, const IrView* ir,

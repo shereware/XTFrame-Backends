@@ -26,11 +26,13 @@
 #include "../Common/print_version.h"
 #include "../Common/spec_safe_area.h"
 #include "../Common/standard_symbols_note.h"
+#include "view_capture.h"
 #include "view_events.h"
 #include "view_flow.h"
 #include "view_layers.h"
 #include "view_perf_zones.h"
 #include "view_renderer.h"
+#include "xt/advance_plan.h"
 #include "xt/animator.h"
 #include "xt/asset_resolver.h"
 #include "xt/bundle/bundle.h"
@@ -56,6 +58,7 @@
 #include "xt/perf_record.h"
 #include "xt/scene_instance.h"
 #include "xt/shell/app.h"
+#include "xt/shell/gamepad.h"
 #ifndef XT_GL_NO_TEXT
 #include "xt/text/ft_text_shaper.h"
 #include "xt/text/missing_fonts.h"
@@ -94,7 +97,8 @@
 ///                    name.xtui | ui-project.json | bundle.xtproj> [--root DIR] [--width W]
 ///                    [--height H] [--ui <id>] [--no-flow] [--strict]
 ///                    [--msaa N] [--screenshot PATH] [--flow <file.xtflow>] [--headless] [--transparent]
-///                    [--frames N]
+///                    [--frames N] [--stamp-json FILE] [--crop #<id>|x,y,w,h] [--max-edge N]
+///                    [--times <t1,t2,...> [--sheet]] [--jpeg-quality N]
 ///                    [--print-text <id>] [--perf] [--perf-csv <file>] [--show-damage] [--partial]
 ///                    [--idle-skip]
 ///                    [--no-system-fonts] [--no-box-shadow]
@@ -192,6 +196,28 @@
 /// animations, --play and the frames go on from there, and `xtTime` is that clock modulo 3600 s.
 /// With --advance the clock is set first, then advanced. Every run (windowed too).
 ///
+/// T-882 (Docs/design/59-visual-feedback.md §59.4, §59.8): every --screenshot prints the state stamp as
+/// one line `stamp: <JSON>` on stdout (after the `wrote screenshot` line): `renderer` (sw / gl / wgpu, the
+/// one that drew), `backend` (xt_sw, the wgpu adapter or the GL_RENDERER string; left out when unknown),
+/// `source: "scratch"`, `device` {w, h, dpr, uiscale, safe}, `lang`, `theme` (when one is set), `clock`,
+/// `timelines` (--play's), `effects[]` and `notes[]`. `effects[].executed` comes from the renderer's draw
+/// path (SwRenderer::setEffectReport, gpu::FrameBuilder::setEffectReport); the windowed shell run does not
+/// report it and its notes say `effect execution is not reported by this backend`. --stamp-json FILE
+/// writes the same stamp indented by two spaces. --crop #<id> cuts to the element's box and its effects'
+/// reach, --crop x,y,w,h to output pixels (cut to the picture; wholly outside: exit 1); --max-edge N then
+/// shrinks it (xt::sw::downscaleToMaxEdge; 0 = no limit, the default). A .jpg / .jpeg --screenshot is a
+/// JPEG (--jpeg-quality, default 80; transparent pixels over black). Without these flags the picture file
+/// is written exactly as before. --times <t1,t2,...> (T-888; --frames stays the frame count) takes up
+/// to 24 increasing document clock times, --headless only: each is a run of its own from the start, the
+/// picture of `--clock <c> --advance <t - c> --frames 1` bit for bit, written to
+/// `<stem>_<NN>.png` (01-based; .jpg kept), or with --sheet composed into one contact sheet (cells labelled
+/// `<t>s`, two decimals) at the --screenshot path. One stamp with `frames: [{clock, label, file?}]`. The
+/// options that change what one run is or prints per run are refused with --times (exit 2):
+/// --advance, --warmup, --warmup-dt, --screenshot-every, --perf, --perf-csv, --perf-detail, --perf-cpu,
+/// --partial, --idle-skip, --show-damage, --verify-static-skip, --dump-every, --dump-flow-values,
+/// --dump-commands, --print-text, --log-ports, --diagnostics, --layers, --layers-view, --scene-animate,
+/// --frames (T-887).
+///
 /// --fit (Docs/tasks/T-156.md) chooses how the windowed run places the document: `native` lays it
 /// out at the window size (the behaviour before T-156); the other modes lay it out at the design
 /// size and scale/centre that image in the window (xt::shell::FitMode). A `bundle.xtproj` input
@@ -266,9 +292,15 @@
 /// reloads the global flow (T-546: after each reload the flow diagnostics print again; --strict
 /// does not exit on a reload).
 ///
-/// --gamepad (T-194, Docs/design/08-events.md §8.9) opens SDL game controllers in the windowed
-/// mode (one player slot each, in connection order). --players N (1..8) limits the slots to N and
-/// marks players 0..N-1 as gamepad players (Context::setPlayerDevice).
+/// The windowed (shell) mode opens SDL game controllers by default (T-880, Docs/design/
+/// 60-input-channels.md §60.6; T-194, 08 §8.9): one player slot each, in connection order, up to
+/// --players N (1..8; default 1), so a controller plugged in moves pad.* and navigates the focus.
+/// --no-gamepad leaves SDL's game controller subsystem off; --gamepad is accepted and does nothing
+/// (it is the default); --headless never opens it. --players N also marks players 0..N-1 as
+/// gamepad players (Context::setPlayerDevice). T-884: the axes pass the dead zones of
+/// --gamepad-deadzone <left> <right> <trigger> (0..0.9 each, 0 = off; default 0.24 0.265 0.12);
+/// --event axis values do not. A --renderer window opens the controllers too, through the same
+/// xt_shell GamepadInput as the shell (its platform's event hook).
 ///   --pointer "<frame> <x> <y> [move|down|up] [button=left|right|middle]" pushes one raw
 ///   InputEvent at viewport coordinates <x>/<y> (default `move`; T-627: the button, default left)
 ///   through Context::pushInput.
@@ -429,6 +461,7 @@ using xt::tools::view::loadFlow;
 // T-713: --event parsing and application live in view_events.h (shared with xtframe-gpu-probe).
 using xt::tools::view::applyScriptedEvent;
 using xt::tools::view::gamepadButtonFromName;
+using xt::tools::view::jsonQuote;  // T-882: shared with the stamp (view_capture.h)
 using xt::tools::view::parseButtonField;
 using xt::tools::view::parseCoordinate;
 using xt::tools::view::parseEventSpec;
@@ -548,7 +581,16 @@ struct Args {
     float seekTime = -1.0f;                                  // T-172: --seek, < 0 = none.
     float advance = 0.0f;                                    // T-817: --advance, 0 = none.
     double clock = -1.0;                                     // T-870: --clock, < 0 = none.
-    bool gamepad = false;                                    // T-194: --gamepad.
+    // T-882 (59 §59.4, §59.8): the stamp file, --crop, --max-edge, --times (T-888), --sheet, JPEG quality.
+    std::string stampJson;           // --stamp-json FILE, empty = none (the stamp still goes to stdout).
+    xt::tools::view::CropSpec crop;  // --crop #id | x,y,w,h
+    int maxEdge = 0;                 // --max-edge N, 0 = no limit.
+    std::vector<double> frameTimes;  // --times <t1,t2,...>, empty = one picture.
+    bool sheet = false;              // --sheet
+    int jpegQuality = xt::tools::view::kDefaultJpegQuality;  // --jpeg-quality N
+    std::vector<std::string> given;  // T-882: every option given, for the --times conflicts.
+    bool noGamepad = false;                                  // T-880: --no-gamepad.
+    float gamepadDeadzone[3] = {0.24f, 0.265f, 0.12f};       // T-884: --gamepad-deadzone L R T.
     uint32_t players = 0;                                    // T-194: --players, 0 = not given.
     std::string project;                                     // T-193: --project <dir>.
     std::string mainUi;         // T-193: the main UI's id when opened through a project / bundle.
@@ -591,6 +633,65 @@ bool parsePointerSpec(const std::string& spec, ScriptedPointer& out) {
 
 bool parsePlanarBinding(const std::string& v, Args::PlanarBinding& out);  // T-806, defined below
 
+/// T-882 (59 §59.8): the options that change what one run is or what it prints per run, so that
+/// `--times` (one run per time point, each from the start) cannot honour them; refused with
+/// a message instead of being ignored. T-887: --frames N too (one picture per time point).
+constexpr const char* kFramesConflicts[] = {"--advance",       "--warmup",
+                                            "--warmup-dt",     "--screenshot-every",
+                                            "--perf",          "--perf-csv",
+                                            "--perf-detail",   "--perf-cpu",
+                                            "--partial",       "--idle-skip",
+                                            "--show-damage",   "--verify-static-skip",
+                                            "--dump-every",    "--dump-flow-values",
+                                            "--dump-commands", "--print-text",
+                                            "--log-ports",     "--diagnostics",
+                                            "--layers",        "--layers-view",
+                                            "--scene-animate", "--frames"};
+
+/// T-882: what the capture options need: --screenshot for each of them, --times for --sheet,
+/// --headless and none of kFramesConflicts for --times. False after its stderr line.
+bool checkCaptureOptions(const Args& out) {
+    auto has = [&out](std::string_view flag) {
+        return std::find(out.given.begin(), out.given.end(), flag) != out.given.end();
+    };
+    if (out.sheet && out.frameTimes.empty()) {
+        std::fprintf(stderr, "xtframe-view: --sheet needs --times\n");
+        return false;
+    }
+    if (out.screenshot.empty()) {
+        for (const char* flag : {"--times", "--stamp-json", "--crop", "--max-edge", "--jpeg-quality"}) {
+            if (has(flag)) {
+                std::fprintf(stderr, "xtframe-view: %s needs --screenshot\n", flag);
+                return false;
+            }
+        }
+    }
+    if (out.frameTimes.empty()) {
+        return true;
+    }
+    if (!out.headless) {
+        std::fprintf(stderr, "xtframe-view: --times needs --headless\n");
+        return false;
+    }
+    for (const char* flag : kFramesConflicts) {
+        if (has(flag)) {
+            std::fprintf(stderr,
+                         "xtframe-view: --times cannot be combined with %s (each time point is "
+                         "a run of its own from the start)\n",
+                         flag);
+            return false;
+        }
+    }
+    if (out.clock >= 0.0 && out.frameTimes.front() < out.clock) {
+        std::fprintf(stderr,
+                     "xtframe-view: --times: the times are document clock values; %s is before --clock %s\n",
+                     xt::tools::view::numberText(out.frameTimes.front()).c_str(),
+                     xt::tools::view::numberText(out.clock).c_str());
+        return false;
+    }
+    return true;
+}
+
 bool parseArgs(int argc, char** argv, Args& out) {
     // T-420: --version wins over every other argument, a malformed one included. T-426:
     // --list-fonts is the same kind of pre-scanned flag, after --version.
@@ -612,6 +713,9 @@ bool parseArgs(int argc, char** argv, Args& out) {
     std::vector<std::string> positional;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
+        if (arg.size() > 1 && arg[0] == '-') {
+            out.given.push_back(arg);  // T-882
+        }
         auto needValue = [&](const char* flag, std::string& dst) -> bool {
             if (i + 1 >= argc) {
                 std::fprintf(stderr, "xtframe-view: %s requires an argument\n", flag);
@@ -722,7 +826,26 @@ bool parseArgs(int argc, char** argv, Args& out) {
             out.dumpEvery = static_cast<uint32_t>(std::strtoul(v.c_str(), nullptr, 10));
             out.dumpFlowValues = true;  // --dump-every implies --dump-flow-values.
         } else if (arg == "--gamepad") {
-            out.gamepad = true;  // T-194.
+            // T-194; T-880: the default now, accepted for old command lines.
+        } else if (arg == "--no-gamepad") {
+            out.noGamepad = true;  // T-880.
+        } else if (arg == "--gamepad-deadzone") {
+            // T-884 (60 §60.6): left stick, right stick, trigger; each 0..0.9 (0 = off).
+            for (float& d : out.gamepadDeadzone) {
+                std::string v;
+                if (!needValue("--gamepad-deadzone", v)) {
+                    return false;
+                }
+                char* end = nullptr;
+                d = std::strtof(v.c_str(), &end);
+                if (end == v.c_str() || *end != '\0' || !(d >= 0.0f && d <= 0.9f)) {
+                    std::fprintf(stderr,
+                                 "xtframe-view: --gamepad-deadzone: expected three numbers 0-0.9 "
+                                 "(left stick, right stick, trigger), got '%s'\n",
+                                 v.c_str());
+                    return false;
+                }
+            }
         } else if (arg == "--players") {
             std::string v;
             if (!needValue("--players", v)) {
@@ -926,6 +1049,47 @@ bool parseArgs(int argc, char** argv, Args& out) {
                 return false;
             }
             out.frames = static_cast<uint32_t>(std::strtoul(v.c_str(), nullptr, 10));
+        } else if (arg == "--times") {
+            // T-882 / T-888 (59 §59.8): the time points, one run each.
+            std::string v;
+            if (!needValue("--times", v)) {
+                return false;
+            }
+            std::string error;
+            if (!xt::tools::view::parseFrameTimes(v, out.frameTimes, error)) {
+                std::fprintf(stderr, "xtframe-view: %s\n", error.c_str());
+                return false;
+            }
+        } else if (arg == "--stamp-json") {
+            if (!needValue("--stamp-json", out.stampJson)) {  // T-882
+                return false;
+            }
+        } else if (arg == "--crop") {
+            std::string v;
+            if (!needValue("--crop", v)) {
+                return false;
+            }
+            if (!xt::tools::view::parseCrop(v, out.crop)) {
+                std::fprintf(stderr, "xtframe-view: --crop: expected #<id> or x,y,w,h (w, h > 0), got '%s'\n",
+                             v.c_str());
+                return false;
+            }
+        } else if (arg == "--max-edge" || arg == "--jpeg-quality") {
+            std::string v;
+            if (!needValue(arg.c_str(), v)) {
+                return false;
+            }
+            char* end = nullptr;
+            const long n = std::strtol(v.c_str(), &end, 10);
+            const bool jpeg = arg == "--jpeg-quality";
+            if (end == v.c_str() || *end != '\0' || n < (jpeg ? 1 : 0) || n > (jpeg ? 100 : 65536)) {
+                std::fprintf(stderr, "xtframe-view: %s: expected %s, got '%s'\n", arg.c_str(),
+                             jpeg ? "1..100" : "pixels >= 0 (0 = no limit)", v.c_str());
+                return false;
+            }
+            (jpeg ? out.jpegQuality : out.maxEdge) = static_cast<int>(n);
+        } else if (arg == "--sheet") {
+            out.sheet = true;
         } else if (arg == "--warmup") {
             std::string v;
             if (!needValue("--warmup", v)) {
@@ -1048,6 +1212,9 @@ bool parseArgs(int argc, char** argv, Args& out) {
     if (out.seekTime >= 0.0f && out.playTimeline.empty()) {
         std::fprintf(stderr, "xtframe-view: --seek needs --play <timeline>\n");
         return false;
+    }
+    if (!checkCaptureOptions(out)) {
+        return false;  // T-882
     }
     if (out.device.aspect > 0.0f && out.height > 0) {
         // T-176: --device W:H shapes the viewport (its width follows --height).
@@ -1586,6 +1753,20 @@ void printUsage(std::FILE* out) {
         "  --msaa N                MSAA samples, 4 or 1 (none), for the windowed backend and\n"
         "                          --renderer gl|wgpu (default 1)\n"
         "  --screenshot PATH       render one frame (or, with --headless, the last one) to a PNG\n"
+        "                          (.jpg / .jpeg: JPEG); prints `stamp: <JSON>` (59.4: the renderer,\n"
+        "                          device, clock, timelines, which effects ran, notes) on stdout\n"
+        "  --stamp-json FILE       also write that stamp to FILE, indented\n"
+        "  --crop #<id> | x,y,w,h  cut the picture to an element (its box and its effects' reach)\n"
+        "                          or to output pixels; partly outside is cut to the picture\n"
+        "  --max-edge N            shrink the picture (area average) so its longest edge is at most\n"
+        "                          N px, after --crop; never enlarges (default 0: no limit)\n"
+        "  --jpeg-quality N        JPEG quality 1-100 for a .jpg / .jpeg --screenshot (default 80)\n"
+        "  --times <t1,t2,...>     headless: up to 24 increasing document clock times; each is a\n"
+        "                          run of its own from the start (= --clock + --advance <t>\n"
+        "                          --frames 1), saved as <stem>_01.png, <stem>_02.png ... next to\n"
+        "                          --screenshot\n"
+        "  --sheet                 with --times: one contact sheet (labels `<t>s`) at the\n"
+        "                          --screenshot path instead\n"
         "  --flow <file.xtflow>    load and tick a signal graph against the document\n"
         "                          (default: the input's own .xtflow, or a bundle UI's)\n"
         "  --ui <id>               which UI of a Bundle / UI Project input to open\n"
@@ -1704,8 +1885,14 @@ void printUsage(std::FILE* out) {
         "  --event \"[<frame>] press <button> [<player>]\"\n"
         "                          press a gamepad button (A B X Y Back Guide Start LS RS LB RB\n"
         "                          Up Down Left Right) for a local player (default 0)\n"
-        "  --gamepad               open SDL game controllers (windowed mode), one player each\n"
-        "  --players N             local players 1-8: gamepad players 0..N-1 (and the slot limit)\n"
+        "  --gamepad               accepted, no effect: game controllers are on by default in the\n"
+        "                          windowed mode (one player slot each, in connection order)\n"
+        "  --no-gamepad            do not open SDL game controllers (windowed mode)\n"
+        "  --gamepad-deadzone L R T\n"
+        "                          the controllers' dead zones: left stick, right stick, trigger\n"
+        "                          (0-0.9 each, 0 = off; default 0.24 0.265 0.12)\n"
+        "  --players N             local players 1-8: gamepad players 0..N-1 and the controller\n"
+        "                          slot limit (default 1)\n"
         "  --help, -h              print this text and exit 0\n"
         "  --version               print the version, IR format and behavior version and exit 0\n"
         "  --list-fonts            print the system fonts as `family<TAB>path` lines and exit 0\n"
@@ -1834,37 +2021,6 @@ struct GpuCounterTotals {
 float dtReaching(double from, double to) {
     const float dt = static_cast<float>(to - from);  // The sum in double is exact; the nearest float.
     return dt < 0.0f ? 0.0f : dt;
-}
-
-/// T-817 (--advance): the first painted frame and its dt. A plain run's frame k shows time k/60 (frame 0
-/// has dt 0, every later one `frameDt`), so `seconds` = N frames of `frameDt` plus a remainder r: with no
-/// remainder the frames 0..N-1 run unpainted and frame N (dt `frameDt`) is the first painted one; with
-/// one, the frames 0..N run unpainted and frame N+1 takes the remainder as its dt. `seconds` 0 = none.
-struct AdvancePlan {
-    uint32_t firstFrame = 0;  ///< Frames 0..firstFrame-1 run without painting.
-    float firstDt = 0.0f;     ///< The dt of the first painted frame.
-};
-
-AdvancePlan planAdvance(float seconds, float frameDt) {
-    AdvancePlan plan;
-    if (!(seconds > 0.0f)) {
-        return plan;
-    }
-    // A float --advance (0.1 -> 0.100000001) is a whole number of frames within 1/1000 of a frame.
-    const double steps = std::min(static_cast<double>(seconds) / static_cast<double>(frameDt),
-                                  static_cast<double>(UINT32_MAX / 2u));
-    const double nearest = std::floor(steps + 0.5);
-    if (std::fabs(steps - nearest) < 1e-3) {
-        if (nearest >= 1.0) {
-            plan.firstFrame = static_cast<uint32_t>(nearest);
-            plan.firstDt = frameDt;
-        }
-        return plan;
-    }
-    const double whole = std::floor(steps);
-    plan.firstFrame = static_cast<uint32_t>(whole) + 1u;
-    plan.firstDt = static_cast<float>((steps - whole) * static_cast<double>(frameDt));
-    return plan;
 }
 
 void printPerfSummary(const xt::PerfSummary& s, float damageAreaPercent = -1.0f, int detail = 0) {
@@ -2448,40 +2604,6 @@ const char* portTypeName(xt::PortValueType type) {
     return "unknown";
 }
 
-/// T-401: `text` as a JSON string literal (quotes included).
-std::string jsonQuote(std::string_view text) {
-    std::string out = "\"";
-    for (const char c : text) {
-        switch (c) {
-            case '"':
-                out += "\\\"";
-                break;
-            case '\\':
-                out += "\\\\";
-                break;
-            case '\n':
-                out += "\\n";
-                break;
-            case '\r':
-                out += "\\r";
-                break;
-            case '\t':
-                out += "\\t";
-                break;
-            default:
-                if (static_cast<unsigned char>(c) < 0x20) {
-                    char buffer[8];
-                    std::snprintf(buffer, sizeof(buffer), "\\u%04x", static_cast<unsigned>(c));
-                    out += buffer;
-                } else {
-                    out += c;
-                }
-        }
-    }
-    out += '"';
-    return out;
-}
-
 /// T-401 (43 §43.4): --dump-ports: the Document's declared ports, in PORT order, as JSON (LF line
 /// endings, one port per line): lookup name, type, direction, default (Document::portText() before
 /// the first frame; "" for struct / list / event) and, where declared, the enum values, a
@@ -2548,6 +2670,205 @@ bool writeScreenshot(const std::string& path, const uint8_t* rgba, int width, in
     }
     std::printf("xtframe-view: wrote screenshot %s (%dx%d)\n", absolute.c_str(), width, height);
     return true;
+}
+
+/// T-882 (59 §59.4): one finished picture of a run (straight-alpha RGBA8, row 0 = top) and what its stamp
+/// is made of; the run's Context is still alive.
+struct HeadlessShot {
+    const uint8_t* rgba = nullptr;
+    int width = 0;
+    int height = 0;
+    int stride = 0;
+    xt::Context* ctx = nullptr;
+    const xt::Document* doc = nullptr;
+    std::string renderer;  ///< sw | gl | wgpu: the one that drew.
+    std::string backend;   ///< Empty: not known.
+    bool effectsReported = false;
+    std::vector<xt::tools::view::EffectRecord> effects;
+    std::vector<std::string> notes;
+};
+
+/// T-882: the stamp of `shot` without its effects: renderer, device, language, clock, --play's timeline.
+xt::tools::view::Stamp stampBase(const Args& args, const HeadlessShot& shot) {
+    xt::tools::view::Stamp s;
+    s.renderer = shot.renderer;
+    s.backend = shot.backend;
+    s.w = static_cast<float>(args.width);
+    s.h = static_cast<float>(args.height);
+    s.dpr = args.width > 0 && shot.width > 0 ? static_cast<float>(shot.width) / static_cast<float>(args.width)
+                                             : 1.0f;
+    if (shot.ctx != nullptr) {
+        s.uiscale = shot.ctx->uiScale();
+        s.safe = shot.ctx->device().safeArea;
+        s.lang = std::string(shot.ctx->language());
+        s.theme = std::string(shot.ctx->theme());
+        s.clock = shot.ctx->clockSeconds();
+    }
+    if (shot.doc != nullptr && !args.playTimeline.empty()) {
+        s.timelines.push_back({args.playTimeline,
+                               static_cast<double>(shot.doc->timelineTime("", args.playTimeline)),
+                               shot.doc->isTimelinePlaying("", args.playTimeline)});
+    }
+    return s;
+}
+
+/// T-882: `shot`'s pixels as a tightly packed image.
+xt::sw::CaptureImage captureOf(const HeadlessShot& shot) {
+    xt::sw::CaptureImage img;
+    img.width = shot.width;
+    img.height = shot.height;
+    const size_t row = static_cast<size_t>(shot.width) * 4;
+    img.rgba.resize(row * static_cast<size_t>(shot.height));
+    for (int y = 0; y < shot.height; ++y) {
+        std::memcpy(img.rgba.data() + row * static_cast<size_t>(y),
+                    shot.rgba + static_cast<size_t>(shot.stride) * static_cast<size_t>(y), row);
+    }
+    return img;
+}
+
+/// T-882: the pixel rectangle of --crop for `shot` (an element's: its box and effects' reach). False after
+/// its stderr line for an element the document does not have.
+bool cropRect(const Args& args, const HeadlessShot& shot, xt::Rect& out) {
+    if (args.crop.id.empty()) {
+        out = args.crop.rect;
+        return true;
+    }
+    const float dpr = args.width > 0 && shot.width > 0
+                          ? static_cast<float>(shot.width) / static_cast<float>(args.width)
+                          : 1.0f;
+    if (shot.doc == nullptr || !xt::tools::view::elementCropRect(*shot.doc, args.crop.id, dpr, out)) {
+        std::fprintf(stderr, "xtframe-view: --crop: no element '%s'\n", args.crop.id.c_str());
+        return false;
+    }
+    return true;
+}
+
+/// T-882: `stamp: <JSON>` on stdout and, with --stamp-json, the same indented into that file.
+bool emitStamp(const Args& args, const xt::tools::view::Stamp& stamp) {
+    std::printf("stamp: %s\n", xt::tools::view::stampJson(stamp, false).c_str());
+    return args.stampJson.empty() ||
+           xt::tools::view::writeTextFile(args.stampJson, xt::tools::view::stampJson(stamp, true));
+}
+
+/// T-882: a single --screenshot: the file (as before when neither --crop, --max-edge nor a .jpg path asks
+/// for more -- the same bytes), then the stamp.
+bool writeSingleShot(const Args& args, const HeadlessShot& shot) {
+    xt::tools::view::Stamp stamp = stampBase(args, shot);
+    xt::Rect region{};
+    const bool cropped = args.crop.given;
+    if (!cropped && args.maxEdge == 0 && !xt::tools::view::isJpegPath(args.screenshot)) {
+        if (!writeScreenshot(args.screenshot, shot.rgba, shot.width, shot.height, shot.stride)) {
+            return false;
+        }
+    } else {
+        xt::sw::CaptureImage img = captureOf(shot);
+        std::string error;
+        if (cropped && !cropRect(args, shot, region)) {
+            return false;
+        }
+        if (!xt::tools::view::shapeImage(img, cropped ? &region : nullptr, args.maxEdge, error)) {
+            std::fprintf(stderr, "xtframe-view: %s\n", error.c_str());
+            return false;
+        }
+        std::string absolute;
+        if (!xt::tools::view::writeImage(args.screenshot, img, args.jpegQuality, absolute)) {
+            return false;
+        }
+    }
+    xt::tools::view::addEffects(stamp, shot.doc, shot.effects, shot.effectsReported,
+                                cropped ? &region : nullptr);
+    stamp.notes.insert(stamp.notes.end(), shot.notes.begin(), shot.notes.end());
+    return emitStamp(args, stamp);
+}
+
+/// T-882 (59 §59.8): --times (T-888). Each time point is a run of its own from the start: --clock (or 0),
+/// then --advance <t - clock> --frames 1 -- the picture of that single run, bit for bit. Without --sheet
+/// every picture goes to `<stem>_<NN>`; with it, one contact sheet (xt::sw::composeSheet, `<t>s` labels)
+/// to the --screenshot path. --crop cuts every picture (an element's rectangle: the first time point's),
+/// --max-edge shrinks each picture, or the sheet's cells so that the sheet fits. One stamp: the first time
+/// point's, plus `frames`.
+int runFrames(Args& args, const std::function<int(const std::function<bool(const HeadlessShot&)>&)>& run) {
+    namespace tv = xt::tools::view;
+    const std::vector<double> times = args.frameTimes;
+    const double start = args.clock >= 0.0 ? args.clock : 0.0;
+    std::vector<xt::sw::CaptureImage> pictures;
+    tv::Stamp stamp;
+    xt::Rect region{};
+    bool cropped = false;
+    for (size_t i = 0; i < times.size(); ++i) {
+        args.advance = static_cast<float>(times[i] - start);
+        args.frames = 1;
+        const int rc = run([&](const HeadlessShot& shot) {
+            if (i == 0) {
+                stamp = stampBase(args, shot);
+                if (args.crop.given) {
+                    if (!cropRect(args, shot, region)) {
+                        return false;
+                    }
+                    cropped = true;
+                }
+                tv::addEffects(stamp, shot.doc, shot.effects, shot.effectsReported,
+                               cropped ? &region : nullptr);
+                stamp.notes.insert(stamp.notes.end(), shot.notes.begin(), shot.notes.end());
+            }
+            xt::sw::CaptureImage img = captureOf(shot);
+            std::string error;
+            if (!tv::shapeImage(img, cropped ? &region : nullptr, 0, error)) {
+                std::fprintf(stderr, "xtframe-view: %s\n", error.c_str());
+                return false;
+            }
+            pictures.push_back(std::move(img));
+            return true;
+        });
+        if (rc != 0) {
+            return rc;
+        }
+    }
+    for (size_t i = 0; i < times.size(); ++i) {
+        stamp.frames.push_back({times[i], tv::frameLabel(times[i]), std::string()});
+    }
+    if (!args.sheet) {
+        for (size_t i = 0; i < pictures.size(); ++i) {
+            const xt::sw::CaptureImage img =
+                args.maxEdge > 0 ? xt::sw::downscaleToMaxEdge(pictures[i], args.maxEdge) : pictures[i];
+            if (!tv::writeImage(tv::framePath(args.screenshot, i + 1), img, args.jpegQuality,
+                                stamp.frames[i].file)) {
+                return 1;
+            }
+        }
+        return emitStamp(args, stamp) ? 0 : 1;
+    }
+    // The contact sheet, as view.capture's: ceil(sqrt(n)) columns; --max-edge shrinks the cells.
+    const int n = static_cast<int>(pictures.size());
+    const int cols = static_cast<int>(std::ceil(std::sqrt(static_cast<double>(n))));
+    const int rows = (n + cols - 1) / cols;
+    const int cw = pictures[0].width;
+    const int ch = pictures[0].height;
+    int cellEdge = 0;
+    if (args.maxEdge > 0) {
+        const double sx = static_cast<double>(args.maxEdge - (cols - 1) * xt::sw::kSheetGap) / (cols * cw);
+        const double sy = static_cast<double>(args.maxEdge - (rows - 1) * xt::sw::kSheetGap) / (rows * ch);
+        const double scale = std::min(sx, sy);
+        if (scale < 1.0) {
+            cellEdge = std::max(1, static_cast<int>(std::floor(std::max(cw, ch) * std::max(scale, 0.0))));
+        }
+    }
+    std::vector<xt::sw::CaptureImage> cells;
+    std::vector<std::string> labels;
+    for (size_t i = 0; i < pictures.size(); ++i) {
+        cells.push_back(cellEdge > 0 ? xt::sw::downscaleToMaxEdge(pictures[i], cellEdge) : pictures[i]);
+        labels.push_back(stamp.frames[i].label);
+    }
+    xt::sw::CaptureImage sheet;
+    if (xt::sw::composeSheet(cells, labels, cols, sheet) != xt::Status::kOk) {
+        std::fprintf(stderr, "xtframe-view: --sheet: cannot compose the contact sheet\n");
+        return 1;
+    }
+    std::string absolute;
+    if (!tv::writeImage(args.screenshot, sheet, args.jpegQuality, absolute)) {
+        return 1;
+    }
+    return emitStamp(args, stamp) ? 0 : 1;
 }
 
 /// T-179: --lang. Loads every `<rootDir>/strings/*.csv` (T-623: else the input's own tables,
@@ -2918,6 +3239,24 @@ int main(int argc, char** argv) {
             }
         }
     }
+    // T-884 (60 §60.6): a --renderer window pumps Code/Backends' platform, not the shell's App; its
+    // event hook hands the controllers to the same xt_shell GamepadInput App uses (hot plug, player
+    // slots, dead zones). Declared after frameTarget: closed before the platform's SDL goes.
+    std::unique_ptr<xt::shell::GamepadInput> rendererGamepads;
+    if (frameTarget && frameTarget->windowed() && !args.noGamepad) {
+        rendererGamepads = std::make_unique<xt::shell::GamepadInput>();
+        rendererGamepads->setDeadzones(xt::shell::GamepadDeadzones{
+            args.gamepadDeadzone[0], args.gamepadDeadzone[1], args.gamepadDeadzone[2]});
+        if (rendererGamepads->enable(static_cast<uint8_t>(args.players != 0 ? args.players : 1))) {
+            xt::shell::GamepadInput* gamepads = rendererGamepads.get();
+            frameTarget->setEventHook([gamepads](const SDL_Event& event, xt::Context& context) {
+                return gamepads->handleEvent(event, context);
+            });
+        } else {
+            std::fprintf(stderr, "xtframe-view: game controllers unavailable: %s\n", SDL_GetError());
+            rendererGamepads.reset();
+        }
+    }
     if (layersMode && (!frameTarget || !frameTarget->supportsLayers())) {
         std::fprintf(stderr, "xtframe-view: --layers / --layers-view need the gl or wgpu renderer\n");
         return 1;
@@ -2926,236 +3265,405 @@ int main(int argc, char** argv) {
         if (!args.secondWindow.empty()) {
             std::fprintf(stderr, "xtframe-view: --second-window needs a window; ignored with --headless\n");
         }
+        // T-882 (59 §59.8): one headless run, from loading the document to its last frame; `onShot` gets the
+        // picture. --times makes one such run per time point, each from the start.
+        auto runHeadless = [&](const std::function<bool(const HeadlessShot&)>& onShot) -> int {
         // No window/GL context at all (Docs/tasks/T-56.md): drive a plain xt::Context + xt_sw
         // software renderer directly, the same pattern Examples/engine_integration/main.cpp uses.
         // Text is shaped with the real FreeType shaper over the system fonts (T-131): a headless
         // screenshot used to come out with no text at all because this path had NullTextShaper.
 #ifndef XT_GL_NO_TEXT
-        xt::text::FtTextShaper shaper;
-        addBundleFonts(args, shaper);  // T-555: before the system fonts.
-        if (!args.noSystemFonts) {
-            shaper.addSystemFonts();
-        }
+            xt::text::FtTextShaper shaper;
+            addBundleFonts(args, shaper);  // T-555: before the system fonts.
+            if (!args.noSystemFonts) {
+                shaper.addSystemFonts();
+            }
 #if !defined(XT_BACKEND_NO_TEXT)
-        if (frameTarget) {
-            frameTarget->setTextShaper(&shaper);  // T-439: the GPU renderers' glyph atlas
-        }
+            if (frameTarget) {
+                frameTarget->setTextShaper(&shaper);  // T-439: the GPU renderers' glyph atlas
+            }
 #endif
 #else
-        xt::NullTextShaper shaper;
+            xt::NullTextShaper shaper;
 #endif
-        xt::FileAssetResolver assets = args.assetRoots.empty()
-                                           ? xt::FileAssetResolver(rootDir, xt::sw::decodeImageBytes)
-                                           : xt::FileAssetResolver(args.assetRoots, xt::sw::decodeImageBytes);
-        assets.setFileStatusFn(&xt::fileStatusUtf8);  // T-263e: the same function the window path passes.
-        if (args.bundle) {
-            args.bundle->registerImageMeta(assets);  // T-759: atlas cells, slices, @2x / @3x variants.
-        }
-        xt::Context ctx(xt::ContextConfig{&shaper, &assets});
-        if (args.clock >= 0.0) {
-            ctx.setClock(args.clock);  // T-870: before the documents load (their clock starts there).
-        }
-        // T-191 (25.3.5b): no decoder here -- an unbound <video>/<external> shows its placeholder.
-        ctx.setExternalPlaceholders(true);
-        ctx.setBoxShadowCommands(!args.noBoxShadow);  // T-680
-        ctx.setWorldLayerOutput(layersMode);          // T-701 (33)
-        xt::view::LayerOrbit layerOrbit(args.layerOptions);
-        std::vector<xt::view::LayerRedraws> layerRedraws;
-        if (args.layersView && !args.headless) {
-            std::fprintf(stderr,
-                         "xtframe-view: layers view: drag with the right button to turn the "
-                         "camera, wheel = depth scale\n");
-        }
-        if (!bindExternalTextures(args, assets, /*upload=*/false, frameTarget.get()) ||
-            !bindPlanarTextures(args, assets, /*upload=*/false, frameTarget.get())) {
-            return 1;
-        }
-        if (!setupLanguage(args, rootDir, localization, ctx)) {
-            return 1;
-        }
-
-        // T-193: --project's other UIs first, so the main UI stays the foreground Document.
-        FlowTargets targets;
-        if (!loadOtherUis(args, ctx, rootDir, targets)) {
-            return 1;
-        }
-        xt::DocumentHandle handle = 0;
-        if (!loadInto(ctx, args.input, rootDir, args.assetRoots, handle)) {
-            return 1;
-        }
-        // T-401: --dump-ports / --log-ports (43 §43.4 corpus); the table holds the declared defaults.
-        uint32_t portLogFrame = 0;
-        if (xt::Document* doc = ctx.document(handle)) {
-            if (!args.dumpPorts.empty() &&
-                !dumpPorts(args.dumpPorts, args.ui.empty() ? args.input : args.ui, *doc)) {
+            xt::FileAssetResolver assets =
+                args.assetRoots.empty() ? xt::FileAssetResolver(rootDir, xt::sw::decodeImageBytes)
+                                        : xt::FileAssetResolver(args.assetRoots, xt::sw::decodeImageBytes);
+            assets.setFileStatusFn(&xt::fileStatusUtf8);  // T-263e: the same function the window path passes.
+            if (args.bundle) {
+                args.bundle->registerImageMeta(assets);  // T-759: atlas cells, slices, @2x / @3x variants.
+            }
+            xt::Context ctx(xt::ContextConfig{&shaper, &assets});
+            if (args.clock >= 0.0) {
+                ctx.setClock(args.clock);  // T-870: before the documents load (their clock starts there).
+            }
+            // T-191 (25.3.5b): no decoder here -- an unbound <video>/<external> shows its placeholder.
+            ctx.setExternalPlaceholders(true);
+            ctx.setBoxShadowCommands(!args.noBoxShadow);  // T-680
+            ctx.setWorldLayerOutput(layersMode);          // T-701 (33)
+            xt::view::LayerOrbit layerOrbit(args.layerOptions);
+            std::vector<xt::view::LayerRedraws> layerRedraws;
+            if (args.layersView && !args.headless) {
+                std::fprintf(stderr,
+                             "xtframe-view: layers view: drag with the right button to turn the "
+                             "camera, wheel = depth scale\n");
+            }
+            if (!bindExternalTextures(args, assets, /*upload=*/false, frameTarget.get()) ||
+                !bindPlanarTextures(args, assets, /*upload=*/false, frameTarget.get())) {
                 return 1;
             }
-            if (args.logPorts) {
-                doc->addPortListener([doc, &portLogFrame](const xt::PortEvent& event) {
-                    static const char* const kKinds[] = {"changed", "emit", "list"};
-                    const int kind = static_cast<int>(event.kind);
-                    std::printf("xtframe-view: port %s %s = %s (frame %u)\n",
-                                kind >= 0 && kind <= 2 ? kKinds[kind] : "unknown",
-                                doc->portInfo(event.port).qualifiedName.c_str(),
-                                doc->portText(event.port).c_str(), portLogFrame);
-                });
-            }
-        }
-        ctx.setViewport(xt::Rect{0, 0, static_cast<float>(args.width), static_cast<float>(args.height)},
-                        1.0f);
-        ctx.setDevice(args.device);  // T-176 (validated by parseArgs()).
-        if (args.logicalHeight > 0.0f) {
-            // T-210: uiscale = output height / the UI Project's design height; T-241: the edge
-            // spec.uiscaleRule names (width or the short edge for a portrait phone).
-            ctx.setUiScale(xt::bundle::uiScaleFor(args.uiscaleRule, static_cast<float>(args.width),
-                                                  static_cast<float>(args.height), args.logicalHeight));
-            // T-345 (25 §25.4.2 item 1): the project's clamp and DPI floor.
-            (void)ctx.setUiScaleLimits(args.uiscaleLimits.clampMin, args.uiscaleLimits.clampMax,
-                                       args.uiscaleLimits.dpiFloor);
-        }
-        for (uint32_t p = 0; p < args.players; ++p) {
-            ctx.setPlayerDevice(static_cast<uint8_t>(p), xt::InputKind::Gamepad);  // T-194.
-        }
-
-        xt::flow::FlowRuntime flowRuntime;
-        flowRuntime.setHostEventListener(printFlowEvent);
-        flowRuntime.setPerfTracker(&ctx.perf());  // T-475 (21 §21.6): the flow stages and counters.
-        targets.main = &flowRuntime;
-        targets.ctx = &ctx;
-        bool hasFlow = !args.flow.empty();
-        if (hasFlow && !loadFlow(ctx, handle, args.flow, flowRuntime, flowUi)) {
-            if (!args.flowAuto) {
-                return 2;
-            }
-            flowRuntime.unload();  // T-827: the UI runs on without its flow.
-            hasFlow = false;
-        }
-        if (hasFlow) {
-            announceFlow();
-            if (!xt::tools::view::reportFlowContinuity(flowRuntime, args.strict)) {  // T-540
-                return 2;
-            }
-        }
-        if (!setupProjectFlows(args, ctx, handle, targets)) {
-            return 2;
-        }
-        if (targets.project.bundle && targets.project.bundle->flowRuntime().isGlobal() &&
-            !xt::tools::view::reportFlowContinuity(targets.project.bundle->flowRuntime(), args.strict)) {
-            return 2;  // T-546: the global flow's diagnostics, as the main flow's above.
-        }
-        auto systemEvent = [&targets](const ScriptedEvent& event) { postSystemEvent(targets, event); };
-
-        ctx.perf().setEnabled(args.perf);
-        ctx.perf().setDetail(args.perfDetail);        // T-747
-        ctx.perf().setThreadCpuTiming(args.perfCpu);  // T-753
-        if (args.verifyStaticSkip) {
-            ctx.setVerifyStaticSkip(true);  // T-748
-        }
-        std::unique_ptr<PerfCsvWriter> csv;
-        if (!args.perfCsv.empty()) {
-            csv = std::make_unique<PerfCsvWriter>(args.perfCsv, args.warmup);
-            if (!csv->ok()) {
-                std::fprintf(stderr, "xtframe-view: failed to open '%s' for writing\n", args.perfCsv.c_str());
+            if (!setupLanguage(args, rootDir, localization, ctx)) {
                 return 1;
             }
-        }
-        // T-753: --perf-detail 2's zones (and <name>.zones.csv beside --perf-csv).
-        const bool zonesOn = args.perf && args.perfDetail >= 2;
-        xt::tools::view::ZoneFrames zoneFrames(
-            zonesOn && !args.perfCsv.empty() ? xt::tools::view::zonesCsvPath(args.perfCsv) : std::string(),
-            args.warmup);
-        if (!zoneFrames.ok()) {
-            std::fprintf(stderr, "xtframe-view: failed to open '%s' for writing\n",
-                         xt::tools::view::zonesCsvPath(args.perfCsv).c_str());
-            return 1;
-        }
 
-        xt::sw::SwRenderer renderer;
-        std::vector<uint8_t> pixels(static_cast<size_t>(args.width) * static_cast<size_t>(args.height) * 4);
-        const int strideBytes = args.width * 4;
-        xt::sw::SwTarget target{pixels.data(), args.width, args.height, strideBytes};
-        // T-343: --scene: the image under the UI, Direct mode (the renderer never clears).
-        std::vector<uint8_t> scene;
-        int sceneOffset = 0;
-        if (!args.scene.empty()) {
-            std::vector<uint8_t> raw;
-            int sw = 0, sh = 0;
-            if (!loadScene(args.scene, raw, sw, sh)) {
+            // T-193: --project's other UIs first, so the main UI stays the foreground Document.
+            FlowTargets targets;
+            if (!loadOtherUis(args, ctx, rootDir, targets)) {
                 return 1;
             }
-            resampleRgba(raw, sw, sh, args.width, args.height, scene);
-            ctx.setHostTargetMode(xt::HostTargetMode::Direct);
-        }
-        auto fillScene = [&]() {
-            for (int y = 0; y < args.height; ++y) {
-                const uint8_t* src =
-                    scene.data() + static_cast<size_t>(y) * static_cast<size_t>(args.width) * 4u;
-                uint8_t* dst = pixels.data() + static_cast<size_t>(y) * static_cast<size_t>(strideBytes);
-                for (int x = 0; x < args.width; ++x) {
-                    const int sx = (x + sceneOffset) % args.width;
-                    std::memcpy(dst + static_cast<size_t>(x) * 4u, src + static_cast<size_t>(sx) * 4u, 3);
-                    dst[static_cast<size_t>(x) * 4u + 3] = 255;
+            xt::DocumentHandle handle = 0;
+            if (!loadInto(ctx, args.input, rootDir, args.assetRoots, handle)) {
+                return 1;
+            }
+            // T-401: --dump-ports / --log-ports (43 §43.4 corpus); the table holds the declared defaults.
+            uint32_t portLogFrame = 0;
+            if (xt::Document* doc = ctx.document(handle)) {
+                if (!args.dumpPorts.empty() &&
+                    !dumpPorts(args.dumpPorts, args.ui.empty() ? args.input : args.ui, *doc)) {
+                    return 1;
+                }
+                if (args.logPorts) {
+                    doc->addPortListener([doc, &portLogFrame](const xt::PortEvent& event) {
+                        static const char* const kKinds[] = {"changed", "emit", "list"};
+                        const int kind = static_cast<int>(event.kind);
+                        std::printf("xtframe-view: port %s %s = %s (frame %u)\n",
+                                    kind >= 0 && kind <= 2 ? kKinds[kind] : "unknown",
+                                    doc->portInfo(event.port).qualifiedName.c_str(),
+                                    doc->portText(event.port).c_str(), portLogFrame);
+                    });
                 }
             }
-            if (args.sceneAnimate) {
-                sceneOffset = (sceneOffset + 1) % args.width;
+            ctx.setViewport(xt::Rect{0, 0, static_cast<float>(args.width), static_cast<float>(args.height)},
+                            1.0f);
+            ctx.setDevice(args.device);  // T-176 (validated by parseArgs()).
+            if (args.logicalHeight > 0.0f) {
+                // T-210: uiscale = output height / the UI Project's design height; T-241: the edge
+                // spec.uiscaleRule names (width or the short edge for a portrait phone).
+                ctx.setUiScale(xt::bundle::uiScaleFor(args.uiscaleRule, static_cast<float>(args.width),
+                                                      static_cast<float>(args.height), args.logicalHeight));
+                // T-345 (25 §25.4.2 item 1): the project's clamp and DPI floor.
+                (void)ctx.setUiScaleLimits(args.uiscaleLimits.clampMin, args.uiscaleLimits.clampMax,
+                                           args.uiscaleLimits.dpiFloor);
             }
-        };
-        xt::CommandList list;
-        xt::DamageList damage;
-        // T-98: the damage diff needs the previous frame's command list, which Context::render()
-        // takes back out of `list` -- so `list` is never cleared here.
-        // T-642: --partial hands the DamageList to the plain software path below.
-        const bool partialRedraw = args.partial && !frameTarget && scene.empty();
-        if (args.partial && !partialRedraw) {
-            std::fprintf(stderr,
-                         "xtframe-view: --partial applies to the default software path only; ignored\n");
-        }
-        if (partialRedraw && args.showDamage) {
-            std::fprintf(stderr, "xtframe-view: --show-damage is ignored with --partial\n");
-        }
-        const bool showDamage = args.showDamage && !partialRedraw;
-        bool trackDamage = args.perf || showDamage || partialRedraw || !args.scene.empty();  // T-343: bands
-        float damageAreaSum = 0.0f;
-        const float dt = 1.0f / 60.0f;
-        uint32_t frameCount = args.frames > 0 ? args.frames : 1;
-        // T-439: a windowed FrameTarget runs until the window closes (or --warmup + 1 frames for a
-        // --screenshot), with the platform's events and clock.
-        const bool windowLoop = frameTarget && frameTarget->windowed();
-        if (windowLoop) {
-            frameCount = args.screenshot.empty() ? UINT32_MAX : args.warmup + 1;
-        }
-        double lastTime = windowLoop ? frameTarget->seconds() : 0.0;
-        GpuCounterTotals gpuTotals;     // T-658
-        UnaccountedTotals unaccounted;  // T-750
-        // T-749 (--idle-skip): the frames skipped, whether one was skipped since the last update(), and
-        // the clock a run that never skips would have (the dts added as Context::update() adds them).
-        uint32_t idleSkipped = 0;
-        bool skippedSinceUpdate = false;
-        double runClock = ctx.clockSeconds();  // T-870: --clock
-        // T-817: --advance, the frames before the first painted one -- updated as a plain run updates
-        // them (same dts, scripted input and flow ticks), never rendered.
-        const AdvancePlan advance = planAdvance(windowLoop ? 0.0f : args.advance, dt);
-        if (windowLoop && args.advance > 0.0f) {
-            std::fprintf(stderr,
-                         "xtframe-view: --advance applies to --headless and --renderer runs; ignored\n");
-        }
-        if (advance.firstFrame > 0) {
-            ctx.perf().setEnabled(false);  // Not measured: the painted frames are.
-            for (uint32_t frame = 0; frame < advance.firstFrame; ++frame) {
-                const float frameDt = frame == 0 ? 0.0f : dt;
+            for (uint32_t p = 0; p < args.players; ++p) {
+                ctx.setPlayerDevice(static_cast<uint8_t>(p), xt::InputKind::Gamepad);  // T-194.
+            }
+
+            xt::flow::FlowRuntime flowRuntime;
+            flowRuntime.setHostEventListener(printFlowEvent);
+            flowRuntime.setPerfTracker(&ctx.perf());  // T-475 (21 §21.6): the flow stages and counters.
+            targets.main = &flowRuntime;
+            targets.ctx = &ctx;
+            bool hasFlow = !args.flow.empty();
+            if (hasFlow && !loadFlow(ctx, handle, args.flow, flowRuntime, flowUi)) {
+                if (!args.flowAuto) {
+                    return 2;
+                }
+                flowRuntime.unload();  // T-827: the UI runs on without its flow.
+                hasFlow = false;
+            }
+            if (hasFlow) {
+                announceFlow();
+                if (!xt::tools::view::reportFlowContinuity(flowRuntime, args.strict)) {  // T-540
+                    return 2;
+                }
+            }
+            if (!setupProjectFlows(args, ctx, handle, targets)) {
+                return 2;
+            }
+            if (targets.project.bundle && targets.project.bundle->flowRuntime().isGlobal() &&
+                !xt::tools::view::reportFlowContinuity(targets.project.bundle->flowRuntime(), args.strict)) {
+                return 2;  // T-546: the global flow's diagnostics, as the main flow's above.
+            }
+            auto systemEvent = [&targets](const ScriptedEvent& event) { postSystemEvent(targets, event); };
+
+            ctx.perf().setEnabled(args.perf);
+            ctx.perf().setDetail(args.perfDetail);        // T-747
+            ctx.perf().setThreadCpuTiming(args.perfCpu);  // T-753
+            if (args.verifyStaticSkip) {
+                ctx.setVerifyStaticSkip(true);  // T-748
+            }
+            std::unique_ptr<PerfCsvWriter> csv;
+            if (!args.perfCsv.empty()) {
+                csv = std::make_unique<PerfCsvWriter>(args.perfCsv, args.warmup);
+                if (!csv->ok()) {
+                    std::fprintf(stderr, "xtframe-view: failed to open '%s' for writing\n",
+                                 args.perfCsv.c_str());
+                    return 1;
+                }
+            }
+            // T-753: --perf-detail 2's zones (and <name>.zones.csv beside --perf-csv).
+            const bool zonesOn = args.perf && args.perfDetail >= 2;
+            xt::tools::view::ZoneFrames zoneFrames(zonesOn && !args.perfCsv.empty()
+                                                       ? xt::tools::view::zonesCsvPath(args.perfCsv)
+                                                       : std::string(),
+                                                   args.warmup);
+            if (!zoneFrames.ok()) {
+                std::fprintf(stderr, "xtframe-view: failed to open '%s' for writing\n",
+                             xt::tools::view::zonesCsvPath(args.perfCsv).c_str());
+                return 1;
+            }
+
+            xt::sw::SwRenderer renderer;
+            // T-882 (59 §59.4): the effects the last painted frame drew, from the renderer's draw path
+            // (xt_sw: SwRenderer::setEffectReport, cleared before each frame; gl / wgpu: gpu::FrameBuilder's,
+            // the last build's). A target that reports neither says so in the stamp.
+            std::vector<xt::sw::SwEffectReport> swReports;
+            std::vector<xt::gpu::FrameBuilder::EffectReport> gpuReports;
+            bool effectsReported = !layersMode;
+            if (!args.screenshot.empty()) {
+                if (frameTarget) {
+                    effectsReported =
+                        effectsReported && frameTarget->setEffectReport(&swReports, &gpuReports);
+                } else {
+                    renderer.setEffectReport(&swReports);
+                }
+            }
+            std::vector<uint8_t> pixels(static_cast<size_t>(args.width) * static_cast<size_t>(args.height) *
+                                        4);
+            const int strideBytes = args.width * 4;
+            xt::sw::SwTarget target{pixels.data(), args.width, args.height, strideBytes};
+            // T-343: --scene: the image under the UI, Direct mode (the renderer never clears).
+            std::vector<uint8_t> scene;
+            int sceneOffset = 0;
+            if (!args.scene.empty()) {
+                std::vector<uint8_t> raw;
+                int sw = 0, sh = 0;
+                if (!loadScene(args.scene, raw, sw, sh)) {
+                    return 1;
+                }
+                resampleRgba(raw, sw, sh, args.width, args.height, scene);
+                ctx.setHostTargetMode(xt::HostTargetMode::Direct);
+            }
+            auto fillScene = [&]() {
+                for (int y = 0; y < args.height; ++y) {
+                    const uint8_t* src =
+                        scene.data() + static_cast<size_t>(y) * static_cast<size_t>(args.width) * 4u;
+                    uint8_t* dst = pixels.data() + static_cast<size_t>(y) * static_cast<size_t>(strideBytes);
+                    for (int x = 0; x < args.width; ++x) {
+                        const int sx = (x + sceneOffset) % args.width;
+                        std::memcpy(dst + static_cast<size_t>(x) * 4u, src + static_cast<size_t>(sx) * 4u, 3);
+                        dst[static_cast<size_t>(x) * 4u + 3] = 255;
+                    }
+                }
+                if (args.sceneAnimate) {
+                    sceneOffset = (sceneOffset + 1) % args.width;
+                }
+            };
+            xt::CommandList list;
+            xt::DamageList damage;
+            // T-98: the damage diff needs the previous frame's command list, which Context::render()
+            // takes back out of `list` -- so `list` is never cleared here.
+            // T-642: --partial hands the DamageList to the plain software path below.
+            const bool partialRedraw = args.partial && !frameTarget && scene.empty();
+            if (args.partial && !partialRedraw) {
+                std::fprintf(stderr,
+                             "xtframe-view: --partial applies to the default software path only; ignored\n");
+            }
+            if (partialRedraw && args.showDamage) {
+                std::fprintf(stderr, "xtframe-view: --show-damage is ignored with --partial\n");
+            }
+            const bool showDamage = args.showDamage && !partialRedraw;
+            bool trackDamage =
+                args.perf || showDamage || partialRedraw || !args.scene.empty();  // T-343: bands
+            float damageAreaSum = 0.0f;
+            const float dt = 1.0f / 60.0f;
+            uint32_t frameCount = args.frames > 0 ? args.frames : 1;
+            // T-439: a windowed FrameTarget runs until the window closes (or --warmup + 1 frames for a
+            // --screenshot), with the platform's events and clock.
+            const bool windowLoop = frameTarget && frameTarget->windowed();
+            if (windowLoop) {
+                frameCount = args.screenshot.empty() ? UINT32_MAX : args.warmup + 1;
+            }
+            double lastTime = windowLoop ? frameTarget->seconds() : 0.0;
+            GpuCounterTotals gpuTotals;     // T-658
+            UnaccountedTotals unaccounted;  // T-750
+            // T-749 (--idle-skip): the frames skipped, whether one was skipped since the last update(), and
+            // the clock a run that never skips would have (the dts added as Context::update() adds them).
+            uint32_t idleSkipped = 0;
+            bool skippedSinceUpdate = false;
+            double runClock = ctx.clockSeconds();  // T-870: --clock
+            // T-817: --advance, the frames before the first painted one -- updated as a plain run updates
+            // them (same dts, scripted input and flow ticks), never rendered.
+            const xt::AdvancePlan advance = xt::planAdvance(windowLoop ? 0.0f : args.advance, dt);
+            if (windowLoop && args.advance > 0.0f) {
+                std::fprintf(stderr,
+                             "xtframe-view: --advance applies to --headless and --renderer runs; ignored\n");
+            }
+            if (advance.firstFrame > 0) {
+                ctx.perf().setEnabled(false);  // Not measured: the painted frames are.
+                for (uint32_t frame = 0; frame < advance.firstFrame; ++frame) {
+                    const float frameDt = frame == 0 ? 0.0f : dt;
+                    portLogFrame = frame;
+                    raiseTextureVersions(args, assets, frame);
+                    applyScriptedInput(args, ctx, handle, frame, systemEvent);
+                    ctx.update(frameDt);
+                    if (frame == 0) {
+                        reportMissingFonts(ctx.document(handle), shaper);
+                    }
+                    if (hasFlow) {
+                        flowRuntime.tick(frameDt);
+                    }
+                    if (targets.project.bundle) {
+                        targets.project.bundle->tick(frameDt);
+                    }
+                    if (hasFlow && args.dumpEvery > 0 && (frame + 1) % args.dumpEvery == 0) {
+                        printFlowValues(flowRuntime, frame);
+                    }
+                    if (targets.project.bundle && targets.project.bundle->flowRuntime().isGlobal() &&
+                        args.dumpEvery > 0 && (frame + 1) % args.dumpEvery == 0) {
+                        printFlowValues(targets.project.bundle->flowRuntime(), frame, "global flow");
+                    }
+                }
+                ctx.perf().setEnabled(args.perf);
+                runClock = ctx.clockSeconds();
+            }
+            const uint32_t firstFrame = advance.firstFrame;
+            const uint32_t endFrame = frameCount > UINT32_MAX - firstFrame
+                                          ? UINT32_MAX
+                                          : firstFrame + frameCount;  // frame < endFrame
+            for (uint32_t frame = firstFrame; frame < endFrame; ++frame) {
+                float frameDt = frame == firstFrame ? advance.firstDt : dt;
+                if (windowLoop) {
+                    if (!frameTarget->pump(ctx)) {
+                        frameCount = frame;
+                        break;
+                    }
+                    if (layersMode) {
+                        // T-701: the pointer through the viewer's camera; right-drag and wheel are its own.
+                        layerOrbit.filterInput(ctx, list.viewport.w, list.viewport.h);
+                    }
+                    const double now = frameTarget->seconds();
+                    frameDt = frame == 0                 ? 0.0f
+                              : !args.screenshot.empty() ? args.warmupDt
+                                                         : static_cast<float>(now - lastTime);
+                    lastTime = now;
+                }
                 portLogFrame = frame;
-                raiseTextureVersions(args, assets, frame);
-                applyScriptedInput(args, ctx, handle, frame, systemEvent);
+                raiseTextureVersions(args, assets, frame);  // T-746: before the idle test (wakes the Context)
+                if (args.idleSkip) {
+                    // T-749: this frame's scripted input first -- it wakes the Context.
+                    applyScriptedInput(args, ctx, handle, frame, systemEvent);
+                    runClock += static_cast<double>(frameDt);
+                    const bool lastShot = windowLoop && !args.screenshot.empty() && frame + 1 == endFrame;
+                    if (frame > firstFrame && !lastShot && !ctx.needsFrame() &&
+                        !(hasFlow && flowRuntime.needsTick())) {
+                        ++idleSkipped;
+                        skippedSinceUpdate = true;
+                        continue;
+                    }
+                    if (skippedSinceUpdate) {
+                        // The time skipped, to the same clock.
+                        frameDt = dtReaching(ctx.clockSeconds(), runClock);
+                        skippedSinceUpdate = false;
+                    }
+                    ctx.perf().markFrameStart();
+                } else {
+                    ctx.perf().markFrameStart();  // T-750 (57 §57.2 item 2): the frame's work starts here
+                    // T-125: queued before update(), which drains and dispatches the queue first.
+                    applyScriptedInput(args, ctx, handle, frame, systemEvent);
+                }
                 ctx.update(frameDt);
                 if (frame == 0) {
-                    reportMissingFonts(ctx.document(handle), shaper);
+                    reportMissingFonts(ctx.document(handle), shaper);  // T-569
                 }
-                if (hasFlow) {
-                    flowRuntime.tick(frameDt);
+                if (hasFlow || targets.project.bundle) {
+                    xt::PerfPhaseScope flowScope(ctx.perf(), &xt::FrameStats::flowMs,
+                                                 &xt::FrameStats::flowCpuMs);
+                    if (hasFlow) {
+                        flowRuntime.tick(frameDt);
+                    }
+                    if (targets.project.bundle) {
+                        targets.project.bundle->tick(frameDt);
+                    }
                 }
-                if (targets.project.bundle) {
-                    targets.project.bundle->tick(frameDt);
+                ctx.render(list, trackDamage ? &damage : nullptr);
+                swReports.clear();  // T-882: this frame's effects only
+                if (trackDamage) {
+                    damageAreaSum += damageAreaFraction(damage, damage.viewport);
+                }
+                const xt::Document* doc = ctx.document(handle);
+                const xt::IrView* irView = doc != nullptr ? &doc->ir() : nullptr;
+                if (frameTarget && layersMode) {
+                    // T-701 (33): each changed layer into its own texture, then the layers as quads
+                    // through the viewer's camera.
+                    std::string layerError;
+                    if (!frameTarget->renderLayers(list, &shaper, &assets, irView, &ctx.perf(),
+                                                   layerOrbit.options().density, layerError)) {
+                        std::fprintf(stderr, "xtframe-view: world layers: %s\n", layerError.c_str());
+                        return 1;
+                    }
+                    xt::view::countLayerRedraws(*frameTarget, layerRedraws);
+                    int frameW = 0, frameH = 0;
+                    frameTarget->frameSize(frameW, frameH);
+                    frameTarget->drawLayers(
+                        layerOrbit.boxToSurface(list.viewport.w, list.viewport.h, frameW, frameH));
+                    const bool keepForShot = windowLoop && !args.screenshot.empty() && frame + 1 == endFrame;
+                    if (!keepForShot && !(frame + 1 == endFrame && !args.layersDir.empty())) {
+                        frameTarget->present();
+                    }
+                } else if (frameTarget) {
+                    // T-439: gl / wgpu (or windowed sw) instead of the xt_sw buffer.
+                    frameTarget->render(list, &shaper, &assets, irView, &ctx.perf(),
+                                        trackDamage ? &damage : nullptr);
+                    xt::view::GpuFrameCounters counters;
+                    if (args.perf && frameTarget->gpuCounters(counters)) {
+                        gpuTotals.add(counters);
+                    }
+                    const bool keepForShot = windowLoop && !args.screenshot.empty() && frame + 1 == endFrame;
+                    if (!keepForShot) {
+                        frameTarget->present();
+                    }
+                } else if (!scene.empty()) {
+                    renderer.setTarget(target);
+                    fillScene();
+                    renderer.render(list, &shaper, &assets, irView, &ctx.perf(),
+                                    trackDamage ? &damage : nullptr);
+                } else {
+                    renderer.setTarget(target);
+                    const xt::Color clearColor =
+                        args.transparent ? xt::Color{0, 0, 0, 0} : xt::Color{1, 1, 1, 1};
+                    // T-753 (57 §57.2 item 2): the clear is part of the frame's `build` phase. The full
+                    // repaint below blends every command over the buffer, so the whole buffer must be
+                    // cleared each frame; only --partial (which also draws only the damage) clears less.
+                    const bool partialFrame = partialRedraw && frame != firstFrame && !damage.full;
+                    {
+                        xt::PerfPhaseScope clearScope(ctx.perf(), &xt::FrameStats::renderMs,
+                                                      &xt::FrameStats::buildCpuMs);
+                        if (partialFrame) {
+                            // T-642: as a host keeps its texture -- only the dirty rectangles are cleared
+                            // and redrawn; every other pixel still holds the previous frame.
+                            renderer.clearRects(clearColor, damage.rects);
+                        } else {
+                            renderer.clear(clearColor);
+                        }
+                    }
+                    if (partialFrame) {
+                        renderer.render(list, &shaper, &assets, irView, &ctx.perf(), &damage);
+                    } else {
+                        renderer.render(list, &shaper, &assets, irView, &ctx.perf());
+                    }
+                }
+                ctx.perf().markFrameEnd();  // T-750: after the backend's submit and present
+                unaccounted.note(ctx.perf());
+                if (zonesOn) {
+                    zoneFrames.note(ctx.perf());  // T-753
+                }
+                if (showDamage) {
+                    drawDamageOverlay(pixels.data(), args.width, args.height, strideBytes, damage);
+                }
+                if (csv) {
+                    csv->writeNewFrames(ctx.perf());
                 }
                 if (hasFlow && args.dumpEvery > 0 && (frame + 1) % args.dumpEvery == 0) {
                     printFlowValues(flowRuntime, frame);
@@ -3165,259 +3673,144 @@ int main(int argc, char** argv) {
                     printFlowValues(targets.project.bundle->flowRuntime(), frame, "global flow");
                 }
             }
-            ctx.perf().setEnabled(args.perf);
-            runClock = ctx.clockSeconds();
-        }
-        const uint32_t firstFrame = advance.firstFrame;
-        const uint32_t endFrame =
-            frameCount > UINT32_MAX - firstFrame ? UINT32_MAX : firstFrame + frameCount;  // frame < endFrame
-        for (uint32_t frame = firstFrame; frame < endFrame; ++frame) {
-            float frameDt = frame == firstFrame ? advance.firstDt : dt;
-            if (windowLoop) {
-                if (!frameTarget->pump(ctx)) {
-                    frameCount = frame;
-                    break;
+            if (args.perf) {
+                const uint32_t drawn = frameCount - idleSkipped;  // T-749: the frames updated and rendered
+                printPerfSummary(ctx.perf().summary(drawn),
+                                 drawn > 0 ? 100.0f * damageAreaSum / static_cast<float>(drawn) : 0.0f,
+                                 args.perfDetail);
+                if (args.idleSkip) {
+                    std::printf("idle-skipped frames: %u of %u\n", static_cast<unsigned>(idleSkipped),
+                                static_cast<unsigned>(frameCount));
                 }
-                if (layersMode) {
-                    // T-701: the pointer through the viewer's camera; right-drag and wheel are its own.
-                    layerOrbit.filterInput(ctx, list.viewport.w, list.viewport.h);
-                }
-                const double now = frameTarget->seconds();
-                frameDt = frame == 0                 ? 0.0f
-                          : !args.screenshot.empty() ? args.warmupDt
-                                                     : static_cast<float>(now - lastTime);
-                lastTime = now;
-            }
-            portLogFrame = frame;
-            raiseTextureVersions(args, assets, frame);  // T-746: before the idle test (wakes the Context)
-            if (args.idleSkip) {
-                // T-749: this frame's scripted input first -- it wakes the Context.
-                applyScriptedInput(args, ctx, handle, frame, systemEvent);
-                runClock += static_cast<double>(frameDt);
-                const bool lastShot = windowLoop && !args.screenshot.empty() && frame + 1 == endFrame;
-                if (frame > firstFrame && !lastShot && !ctx.needsFrame() &&
-                    !(hasFlow && flowRuntime.needsTick())) {
-                    ++idleSkipped;
-                    skippedSinceUpdate = true;
-                    continue;
-                }
-                if (skippedSinceUpdate) {
-                    // The time skipped, to the same clock.
-                    frameDt = dtReaching(ctx.clockSeconds(), runClock);
-                    skippedSinceUpdate = false;
-                }
-                ctx.perf().markFrameStart();
-            } else {
-                ctx.perf().markFrameStart();  // T-750 (57 §57.2 item 2): the frame's work starts here
-                // T-125: queued before update(), which drains and dispatches the queue first.
-                applyScriptedInput(args, ctx, handle, frame, systemEvent);
-            }
-            ctx.update(frameDt);
-            if (frame == 0) {
-                reportMissingFonts(ctx.document(handle), shaper);  // T-569
-            }
-            if (hasFlow || targets.project.bundle) {
-                xt::PerfPhaseScope flowScope(ctx.perf(), &xt::FrameStats::flowMs, &xt::FrameStats::flowCpuMs);
-                if (hasFlow) {
-                    flowRuntime.tick(frameDt);
-                }
-                if (targets.project.bundle) {
-                    targets.project.bundle->tick(frameDt);
+                gpuTotals.print(xt::view::rendererName(chosenRenderer));
+                unaccounted.print();  // T-750: the budget's closing line
+                if (zonesOn) {
+                    zoneFrames.print();  // T-753: the second-level zones
                 }
             }
-            ctx.render(list, trackDamage ? &damage : nullptr);
-            if (trackDamage) {
-                damageAreaSum += damageAreaFraction(damage, damage.viewport);
-            }
-            const xt::Document* doc = ctx.document(handle);
-            const xt::IrView* irView = doc != nullptr ? &doc->ir() : nullptr;
-            if (frameTarget && layersMode) {
-                // T-701 (33): each changed layer into its own texture, then the layers as quads
-                // through the viewer's camera.
-                std::string layerError;
-                if (!frameTarget->renderLayers(list, &shaper, &assets, irView, &ctx.perf(),
-                                               layerOrbit.options().density, layerError)) {
-                    std::fprintf(stderr, "xtframe-view: world layers: %s\n", layerError.c_str());
+            if (!args.layersDir.empty() && frameTarget) {
+                // T-701: the layers and their list, and the last frame of the layers view.
+                if (!xt::view::dumpLayers(*frameTarget, ctx.document(handle), args.layersDir, list.viewport,
+                                          frameCount, layerRedraws)) {
                     return 1;
                 }
-                xt::view::countLayerRedraws(*frameTarget, layerRedraws);
-                int frameW = 0, frameH = 0;
-                frameTarget->frameSize(frameW, frameH);
-                frameTarget->drawLayers(
-                    layerOrbit.boxToSurface(list.viewport.w, list.viewport.h, frameW, frameH));
-                const bool keepForShot = windowLoop && !args.screenshot.empty() && frame + 1 == endFrame;
-                if (!keepForShot && !(frame + 1 == endFrame && !args.layersDir.empty())) {
-                    frameTarget->present();
-                }
-            } else if (frameTarget) {
-                // T-439: gl / wgpu (or windowed sw) instead of the xt_sw buffer.
-                frameTarget->render(list, &shaper, &assets, irView, &ctx.perf(),
-                                    trackDamage ? &damage : nullptr);
-                xt::view::GpuFrameCounters counters;
-                if (args.perf && frameTarget->gpuCounters(counters)) {
-                    gpuTotals.add(counters);
-                }
-                const bool keepForShot = windowLoop && !args.screenshot.empty() && frame + 1 == endFrame;
-                if (!keepForShot) {
-                    frameTarget->present();
-                }
-            } else if (!scene.empty()) {
-                renderer.setTarget(target);
-                fillScene();
-                renderer.render(list, &shaper, &assets, irView, &ctx.perf(), trackDamage ? &damage : nullptr);
-            } else {
-                renderer.setTarget(target);
-                const xt::Color clearColor = args.transparent ? xt::Color{0, 0, 0, 0} : xt::Color{1, 1, 1, 1};
-                // T-753 (57 §57.2 item 2): the clear is part of the frame's `build` phase. The full
-                // repaint below blends every command over the buffer, so the whole buffer must be
-                // cleared each frame; only --partial (which also draws only the damage) clears less.
-                const bool partialFrame = partialRedraw && frame != firstFrame && !damage.full;
-                {
-                    xt::PerfPhaseScope clearScope(ctx.perf(), &xt::FrameStats::renderMs,
-                                                  &xt::FrameStats::buildCpuMs);
-                    if (partialFrame) {
-                        // T-642: as a host keeps its texture -- only the dirty rectangles are cleared
-                        // and redrawn; every other pixel still holds the previous frame.
-                        renderer.clearRects(clearColor, damage.rects);
-                    } else {
-                        renderer.clear(clearColor);
+                std::vector<uint8_t> preview;
+                int previewW = 0, previewH = 0;
+                if (frameTarget->read(preview, previewW, previewH)) {
+                    const std::string previewPath =
+                        pathToUtf8(pathFromUtf8(args.layersDir) / pathFromUtf8("preview.png"));
+                    if (!writeScreenshot(previewPath, preview.data(), previewW, previewH, previewW * 4)) {
+                        return 1;
                     }
                 }
-                if (partialFrame) {
-                    renderer.render(list, &shaper, &assets, irView, &ctx.perf(), &damage);
-                } else {
-                    renderer.render(list, &shaper, &assets, irView, &ctx.perf());
+                if (windowLoop || args.screenshot.empty()) {
+                    frameTarget->present();
                 }
             }
-            ctx.perf().markFrameEnd();  // T-750: after the backend's submit and present
-            unaccounted.note(ctx.perf());
-            if (zonesOn) {
-                zoneFrames.note(ctx.perf());  // T-753
-            }
-            if (showDamage) {
-                drawDamageOverlay(pixels.data(), args.width, args.height, strideBytes, damage);
-            }
-            if (csv) {
-                csv->writeNewFrames(ctx.perf());
-            }
-            if (hasFlow && args.dumpEvery > 0 && (frame + 1) % args.dumpEvery == 0) {
-                printFlowValues(flowRuntime, frame);
-            }
-            if (targets.project.bundle && targets.project.bundle->flowRuntime().isGlobal() &&
-                args.dumpEvery > 0 && (frame + 1) % args.dumpEvery == 0) {
-                printFlowValues(targets.project.bundle->flowRuntime(), frame, "global flow");
-            }
-        }
-        if (args.perf) {
-            const uint32_t drawn = frameCount - idleSkipped;  // T-749: the frames updated and rendered
-            printPerfSummary(ctx.perf().summary(drawn),
-                             drawn > 0 ? 100.0f * damageAreaSum / static_cast<float>(drawn) : 0.0f,
-                             args.perfDetail);
-            if (args.idleSkip) {
-                std::printf("idle-skipped frames: %u of %u\n", static_cast<unsigned>(idleSkipped),
-                            static_cast<unsigned>(frameCount));
-            }
-            gpuTotals.print(xt::view::rendererName(chosenRenderer));
-            unaccounted.print();  // T-750: the budget's closing line
-            if (zonesOn) {
-                zoneFrames.print();  // T-753: the second-level zones
-            }
-        }
-        if (!args.layersDir.empty() && frameTarget) {
-            // T-701: the layers and their list, and the last frame of the layers view.
-            if (!xt::view::dumpLayers(*frameTarget, ctx.document(handle), args.layersDir, list.viewport,
-                                      frameCount, layerRedraws)) {
-                return 1;
-            }
-            std::vector<uint8_t> preview;
-            int previewW = 0, previewH = 0;
-            if (frameTarget->read(preview, previewW, previewH)) {
-                const std::string previewPath =
-                    pathToUtf8(pathFromUtf8(args.layersDir) / pathFromUtf8("preview.png"));
-                if (!writeScreenshot(previewPath, preview.data(), previewW, previewH, previewW * 4)) {
+            // T-125: --screenshot works headless too -- the software buffer above already holds the
+            // last frame, so nothing needs a GL context. T-439: a FrameTarget is read back instead.
+            // T-882: the picture goes to `onShot` (the file, the stamp) while the Context is alive.
+            if (!args.screenshot.empty()) {
+                std::vector<uint8_t> shot;
+                HeadlessShot info;
+                if (frameTarget) {
+                    int shotW = 0;
+                    int shotH = 0;
+                    if (!frameTarget->read(shot, shotW, shotH)) {
+                        std::fprintf(stderr, "xtframe-view: cannot read the %s frame back for '%s'\n",
+                                     xt::view::rendererName(chosenRenderer), args.screenshot.c_str());
+                        return 1;
+                    }
+                    if (windowLoop) {
+                        frameTarget->present();
+                    }
+                    info.rgba = shot.data();
+                    info.width = shotW;
+                    info.height = shotH;
+                    info.stride = shotW * 4;
+                    info.renderer = xt::view::rendererName(chosenRenderer);
+                    info.backend = frameTarget->backendName();
+                } else {
+                    info.rgba = pixels.data();
+                    info.width = args.width;
+                    info.height = args.height;
+                    info.stride = strideBytes;
+                    info.renderer = "sw";
+                    info.backend = "xt_sw";
+                }
+                info.ctx = &ctx;
+                info.doc = ctx.document(handle);
+                info.effectsReported = effectsReported;
+                info.effects = !gpuReports.empty() ? xt::tools::view::effectRecords(gpuReports)
+                                                   : xt::tools::view::effectRecords(swReports);
+                if (partialRedraw) {
+                    info.notes.push_back(
+                        "--partial: only the effects inside the last frame's damage are listed");
+                }
+                if (!onShot(info)) {
                     return 1;
                 }
             }
-            if (windowLoop || args.screenshot.empty()) {
-                frameTarget->present();
+            if (args.strict) {
+                // T-392 (27 §27.3.2): the Document's runtime diagnostics (e.g. a virtualized repeat
+                // with a zero-height viewport) as warnings.
+                if (const xt::Document* doc = ctx.document(handle)) {
+                    for (const std::string& message : doc->warnings()) {
+                        // T-568 (F80): a pool reallocation is a capacity event, not an author warning.
+                        const bool info = message == xt::NodeArena::kWarnEffectPoolGrew;
+                        std::fprintf(stderr, "xtframe-view: %s: %s\n", info ? "info" : "warning",
+                                     message.c_str());
+                        xt::tools::view::noteViewDiagnostic(
+                            "view.runtimeWarning",
+                            info ? xt::compile::Severity::Info : xt::compile::Severity::Warning,
+                            message);  // T-576
+                    }
+                }
             }
-        }
-        // T-125: --screenshot works headless too -- the software buffer above already holds the
-        // last frame, so nothing needs a GL context. T-439: a FrameTarget is read back instead.
-        if (!args.screenshot.empty() && frameTarget) {
-            std::vector<uint8_t> shot;
-            int shotW = 0;
-            int shotH = 0;
-            if (!frameTarget->read(shot, shotW, shotH)) {
-                std::fprintf(stderr, "xtframe-view: cannot read the %s frame back for '%s'\n",
-                             xt::view::rendererName(chosenRenderer), args.screenshot.c_str());
-                return 1;
+            for (const std::string& id : args.printText) {
+                std::string text;
+                const xt::Document* doc = ctx.document(handle);
+                if (doc != nullptr) {
+                    xt::ElementRef ref = doc->byId(id);
+                    if (ref.valid()) {
+                        text = std::string(ref.text());
+                    } else {
+                        std::fprintf(stderr, "xtframe-view: --print-text: no element '%s'\n",
+                                     id.c_str());  // T-392
+                    }
+                }
+                std::printf("text=%s\n", text.c_str());
+            }
+            if (hasFlow && args.dumpFlowValues) {
+                printFlowValues(flowRuntime, firstFrame + frameCount - 1);
+            }
+            if (targets.project.bundle && targets.project.bundle->flowRuntime().isGlobal() &&
+                args.dumpFlowValues) {
+                printFlowValues(targets.project.bundle->flowRuntime(), firstFrame + frameCount - 1,
+                                "global flow");
+            }
+            if (args.dumpCommands) {
+                // T-202: the frame the renderer drew last, one line per command (DrawParticles lists
+                // its instances).
+                std::string dump;
+                xt::dumpCommandList(list, dump);
+                std::fwrite(dump.data(), 1, dump.size(), stdout);
             }
             if (windowLoop) {
-                frameTarget->present();
+                std::printf("xtframe-view: window run complete (%u frames)\n", frameCount);
+                return 0;
             }
-            if (!writeScreenshot(args.screenshot, shot.data(), shotW, shotH, shotW * 4)) {
-                return 1;
+            if (ctx.visualCheck().mismatches > 0) {  // T-748: --verify-static-skip (or the env switch)
+                std::fprintf(stderr, "xtframe-view: static skip verify: %u mismatching frame(s); first: %s\n",
+                             ctx.visualCheck().mismatches, ctx.visualCheck().first.c_str());
             }
-        } else if (!args.screenshot.empty() &&
-                   !writeScreenshot(args.screenshot, pixels.data(), args.width, args.height, strideBytes)) {
-            return 1;
-        }
-        if (args.strict) {
-            // T-392 (27 §27.3.2): the Document's runtime diagnostics (e.g. a virtualized repeat
-            // with a zero-height viewport) as warnings.
-            if (const xt::Document* doc = ctx.document(handle)) {
-                for (const std::string& message : doc->warnings()) {
-                    // T-568 (F80): a pool reallocation is a capacity event, not an author warning.
-                    const bool info = message == xt::NodeArena::kWarnEffectPoolGrew;
-                    std::fprintf(stderr, "xtframe-view: %s: %s\n", info ? "info" : "warning",
-                                 message.c_str());
-                    xt::tools::view::noteViewDiagnostic(
-                        "view.runtimeWarning",
-                        info ? xt::compile::Severity::Info : xt::compile::Severity::Warning,
-                        message);  // T-576
-                }
-            }
-        }
-        for (const std::string& id : args.printText) {
-            std::string text;
-            const xt::Document* doc = ctx.document(handle);
-            if (doc != nullptr) {
-                xt::ElementRef ref = doc->byId(id);
-                if (ref.valid()) {
-                    text = std::string(ref.text());
-                } else {
-                    std::fprintf(stderr, "xtframe-view: --print-text: no element '%s'\n",
-                                 id.c_str());  // T-392
-                }
-            }
-            std::printf("text=%s\n", text.c_str());
-        }
-        if (hasFlow && args.dumpFlowValues) {
-            printFlowValues(flowRuntime, firstFrame + frameCount - 1);
-        }
-        if (targets.project.bundle && targets.project.bundle->flowRuntime().isGlobal() &&
-            args.dumpFlowValues) {
-            printFlowValues(targets.project.bundle->flowRuntime(), firstFrame + frameCount - 1,
-                            "global flow");
-        }
-        if (args.dumpCommands) {
-            // T-202: the frame the renderer drew last, one line per command (DrawParticles lists
-            // its instances).
-            std::string dump;
-            xt::dumpCommandList(list, dump);
-            std::fwrite(dump.data(), 1, dump.size(), stdout);
-        }
-        if (windowLoop) {
-            std::printf("xtframe-view: window run complete (%u frames)\n", frameCount);
+            std::printf("xtframe-view: headless run complete (%u frames)\n", frameCount);
             return 0;
+        };
+        if (args.frameTimes.empty()) {
+            return runHeadless([&args](const HeadlessShot& shot) { return writeSingleShot(args, shot); });
         }
-        if (ctx.visualCheck().mismatches > 0) {  // T-748: --verify-static-skip (or the env switch)
-            std::fprintf(stderr, "xtframe-view: static skip verify: %u mismatching frame(s); first: %s\n",
-                         ctx.visualCheck().mismatches, ctx.visualCheck().first.c_str());
-        }
-        std::printf("xtframe-view: headless run complete (%u frames)\n", frameCount);
-        return 0;
+        return runFrames(args, runHeadless);
     }
 
     xt::shell::WindowConfig windowConfig;
@@ -3432,6 +3825,12 @@ int main(int argc, char** argv) {
     windowConfig.fullscreen = args.fullscreen == 2   ? xt::shell::FullscreenMode::Desktop  // T-398.
                               : args.fullscreen == 1 ? xt::shell::FullscreenMode::Exclusive
                                                      : xt::shell::FullscreenMode::Off;
+    // T-880 (60 §60.6): App opens the game controllers itself, one slot per --players (default 1).
+    windowConfig.gamepad = !args.noGamepad;
+    windowConfig.gamepadPlayers = static_cast<uint8_t>(args.players != 0 ? args.players : 1);
+    windowConfig.gamepadDeadzoneLeft = args.gamepadDeadzone[0];  // T-884
+    windowConfig.gamepadDeadzoneRight = args.gamepadDeadzone[1];
+    windowConfig.gamepadDeadzoneTrigger = args.gamepadDeadzone[2];
     if (!args.fit.empty()) {
         // T-156: parseArgs()/resolveInput() only let a valid mode through.
         xt::shell::parseFitMode(args.fit, windowConfig.fit);
@@ -3529,11 +3928,6 @@ int main(int argc, char** argv) {
     app.context().setDevice(args.device);  // T-176 (validated by parseArgs()).
     for (uint32_t p = 0; p < args.players; ++p) {
         app.context().setPlayerDevice(static_cast<uint8_t>(p), xt::InputKind::Gamepad);  // T-194.
-    }
-    if (args.gamepad &&
-        !app.enableGamepad(static_cast<uint8_t>(args.players != 0 ? args.players : xt::kMaxPlayers))) {
-        std::fprintf(stderr, "xtframe-view: --gamepad: SDL game controller support failed: %s\n",
-                     SDL_GetError());
     }
     app.setTitle(("XTFrame - " + pathToUtf8(inputPath.filename())).c_str());  // UTF-8 (T-261f)
 
@@ -3832,10 +4226,20 @@ int main(int argc, char** argv) {
             }
         }
         app.runFrame(onFrame, args.warmup > 0 ? args.warmupDt : 0.0f, /*swap=*/false);
-        if (!capture(args.screenshot)) {
+        // T-882: the last picture with its stamp; the shell's renderer does not report its effects.
+        std::vector<uint8_t> pixels;
+        HeadlessShot info;
+        if (!app.readPixels(pixels, info.width, info.height)) {
+            std::fprintf(stderr, "xtframe-view: cannot read the window back for '%s'\n",
+                         args.screenshot.c_str());
             return 1;
         }
-        return 0;
+        info.rgba = pixels.data();
+        info.stride = info.width * 4;
+        info.ctx = &app.context();
+        info.doc = app.context().document(handle);
+        info.renderer = xt::view::rendererName(xt::view::defaultRenderer(false));
+        return writeSingleShot(args, info) ? 0 : 1;
     }
 
     int exitCode = app.run(onFrame);

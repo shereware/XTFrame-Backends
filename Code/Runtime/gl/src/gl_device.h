@@ -85,6 +85,9 @@ public:
     void releaseCachedTarget(gpu::TextureHandle target) override;
     uint32_t prepareCustomEffect(std::string_view glsl, const char* names, const uint8_t* types,
                                  uint32_t count) override;
+    std::string customEffectFailure(std::string_view glsl) const override {  // T-892
+        return m_customEffects.failure(glsl);
+    }
     /// T-701 (Docs/design/33-world-layers.md §33.8): a world layer's target is a cached target (an
     /// RGBA8 texture whose name is the handle, rows top-down like an uploaded texture).
     /// `submitLayer` draws the frame into this device's layer scratch (a single-sample RGBA8 +

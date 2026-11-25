@@ -26,6 +26,7 @@ struct GlRenderer::Impl {
     bool frameReused = false;
     std::string lastError;
     std::string lastWarning;  // T-203
+    std::string deviceName;   // T-882: GL_RENDERER
 
     bool init(GlLoadProc loadProc) {
         if (!loadGl(loadProc)) {
@@ -38,6 +39,8 @@ struct GlRenderer::Impl {
             return false;
         }
         builder.init(device);
+        const GLubyte* name = glGetString(GL_RENDERER);  // T-882
+        deviceName = name != nullptr ? reinterpret_cast<const char*>(name) : "";
         initialized = true;
         lastError.clear();
         return true;
@@ -178,6 +181,12 @@ void GlRenderer::invalidateImages() { m_impl->builder.invalidateAllAssets(); }
 const char* GlRenderer::lastError() const { return m_impl->lastError.c_str(); }
 
 bool GlRenderer::wantsAnotherFrame() const { return m_impl->builder.wantsAnotherFrame(); }
+
+void GlRenderer::setEffectReport(std::vector<gpu::FrameBuilder::EffectReport>* out) {
+    m_impl->builder.setEffectReport(out);
+}
+
+const char* GlRenderer::deviceName() const { return m_impl->deviceName.c_str(); }
 
 gpu::GpuDevice* GlRenderer::device() { return m_impl->initialized ? &m_impl->device : nullptr; }
 

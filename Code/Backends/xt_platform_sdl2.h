@@ -4,8 +4,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "xt/context.h"
@@ -63,6 +65,10 @@ public:
     /// Translates every pending event into `context` (see Backend::pumpEvents). False once the
     /// window was closed (SDL_QUIT or its close button).
     bool pumpEvents(Context& context);
+    /// Called by pumpEvents() for every event before it is translated (window close included);
+    /// returning true consumes it. For what this file does not translate -- e.g. game controllers,
+    /// which xtframe-view's --renderer window hands to xt_shell's GamepadInput (T-884). Empty = none.
+    void setEventHook(std::function<bool(const SDL_Event&, Context&)> hook) { m_eventHook = std::move(hook); }
     /// True once after the window's pixel size changed (cleared by the call).
     bool takeResized();
 
@@ -111,6 +117,7 @@ private:
     bool m_textInput = false;
     uint64_t m_startCounter = 0;
     std::string m_error;
+    std::function<bool(const SDL_Event&, Context&)> m_eventHook;  // T-884
 };
 
 }  // namespace xt::backend

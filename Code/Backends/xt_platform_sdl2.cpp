@@ -331,6 +331,7 @@ bool PlatformSdl2::pumpEvents(Context& context) {
     bool open = true;
     SDL_Event event;
     while (SDL_PollEvent(&event) != 0) {
+        if (m_eventHook && m_eventHook(event, context)) continue;  // T-884
         if (event.type == SDL_QUIT) {
             open = false;
             continue;

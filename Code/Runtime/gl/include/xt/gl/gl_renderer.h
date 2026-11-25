@@ -6,6 +6,7 @@
 
 #include "xt/command_list.h"
 #include "xt/damage.h"
+#include "xt/gpu/frame_builder.h"
 #include "xt/gpu/gpu_device.h"
 #include "xt/gpu/gpu_frame.h"
 #include "xt/ir.h"
@@ -156,6 +157,13 @@ public:
     /// T-662 (Docs/design/10-backends.md §10.11 item 2, supplement 2): `gpu::FrameBuilder::
     /// wantsAnotherFrame()` of the frame last built, as `WgpuRenderer::wantsAnotherFrame`.
     bool wantsAnotherFrame() const;
+
+    /// T-882 (Docs/design/59-visual-feedback.md §59.4): `gpu::FrameBuilder::setEffectReport` of this
+    /// renderer's builder -- after a render() `out` holds the custom effects of the frame last built
+    /// (run, or drawn with their fallback because the GLSL did not compile). Null: nothing.
+    void setEffectReport(std::vector<gpu::FrameBuilder::EffectReport>* out);
+    /// T-882: GL_RENDERER of the context init() ran in (the driver's device name); empty before init.
+    const char* deviceName() const;
 
     /// T-701 (Docs/design/33-world-layers.md §33.8): the device behind this renderer, for a
     /// gpu::WorldLayerBuilder (its layer targets, `submitLayer`) and other device-level tools; as

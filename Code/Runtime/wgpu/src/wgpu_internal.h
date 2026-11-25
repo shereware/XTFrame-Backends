@@ -64,6 +64,12 @@ std::string popCreationScopes(WGPUDevice device);
 /// T-456 test hook behind `WgpuDevice::setProbeShaderForTesting` (null = the built-in probe).
 void setProbeShaderOverride(const char* wgsl);
 
+/// The Vulkan-style GLSL fragment shader `Pipelines::prepareCustom` gives the GLSL frontend for the
+/// `.xtfx` module `module` (wgpu_custom.cpp; `names` / `types` / `count` as there). T-892: its `xt`
+/// names are in xt/xtfx_reserved.h, which Tests/wgpu checks.
+std::string wrapCustomModule(std::string_view module, const char* names, const uint8_t* types,
+                             uint32_t count);
+
 /// The fragment programs of Code/Runtime/wgpu/src/shaders (one WGSL file each, prelude.wgsl
 /// prepended). Custom effects (`EffectProgram::Custom`) follow at `kShaderCount + index`.
 enum ShaderId : uint16_t {
@@ -159,6 +165,9 @@ public:
     /// an unknown or failed program.
     bool packCustom(const float* params, size_t available, float* out, uint16_t& shader) const;
     size_t customCount() const { return m_custom.size(); }
+    /// T-892: the compile message `prepareCustom` got for module `glsl` when it failed (cached with
+    /// the failure); empty for a module that compiled or was never prepared.
+    std::string customFailure(std::string_view glsl) const;
 
     /// T-683 (Docs/design/50-c-abi.md §50.ad item 2): one representative render pipeline of every
     /// built-in program (kShaderCount of them; `.xtfx` custom programs are not known yet) plus the blit
@@ -192,6 +201,7 @@ private:
     struct Custom {
         std::string glsl;
         WGPUShaderModule module = nullptr;  ///< null = failed
+        std::string failure;                ///< T-892: module == null: why (the frontend message).
         std::vector<uint8_t> types;
         std::vector<uint8_t> slots;
     };

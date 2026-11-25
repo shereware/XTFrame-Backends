@@ -66,6 +66,20 @@ if(TARGET xtframe-view)
         COMMAND ${_view} "${_hud}" --no-flow --headless --frames 1 --renderer bogus)
     xt_add_expect_exit_test(xtframe-view_renderer_version CODE 0 OUTPUT "renderers: sw"
         COMMAND ${_view} --version)
+    # T-884: a --renderer window opens the game controllers through xt_shell's GamepadInput (or not,
+    # with --no-gamepad); --event axis values still bypass the dead zones. A real controller: untested.
+    set(_t884 "${PROJECT_SOURCE_DIR}/Tests/bundle/fixtures/view_input/view_gamepad.xt")
+    # Only when the shell presents with gl: --renderer sw is then a FrameTarget, not the shell.
+    foreach(_gp gamepad no-gamepad)
+        if(NOT XT_SHELL_GL)
+            break()
+        endif()
+        xt_add_expect_exit_test(xtframe-view_t884_renderer_window_${_gp} CODE 0
+            OUTPUT "renderer sw \\(sdl2 window\\).*text=0[.]25\n|text=0[.]25\n.*renderer sw \\(sdl2 window\\)"
+            COMMAND ${_view} "${_t884}" --renderer sw --hidden --frames 3 --${_gp}
+                    --gamepad-deadzone 0.5 0.5 0.5 --event "0 axis pad.rx 0.25" --print-text RxValue
+                    --screenshot "${CMAKE_BINARY_DIR}/xtframe-view-t884-${_gp}.png")
+    endforeach()
 
     set(_out "${CMAKE_BINARY_DIR}/xtframe-view-renderer-out")
     file(MAKE_DIRECTORY "${_out}")
@@ -104,6 +118,28 @@ if(TARGET xtframe-view)
         set_tests_properties(xtframe-view_renderer_compare_${_a}_${_b} PROPERTIES
                              FIXTURES_REQUIRED xt_view_renderer_shots)
     endforeach()
+    # T-882 (59 §59.4): the stamp's custom effect `executed` comes from each GPU renderer's draw path
+    # (gpu::FrameBuilder::setEffectReport): the shader ran (a renderer unavailable at run time falls back
+    # to sw, which reports false).
+    foreach(_r IN LISTS _renderers)
+        if(NOT _r STREQUAL "sw")
+            add_test(NAME xtframe-view_capture_gpu_${_r}
+                     COMMAND ${CMAKE_COMMAND} -DVIEW=${_view} "-DDOC=${PROJECT_SOURCE_DIR}/Tests/xt/view_capture.xt"
+                             -DMODE=gpu -DRENDERER=${_r} "-DOUT=${CMAKE_BINARY_DIR}/xtframe-view-capture-${_r}"
+                             -P "${PROJECT_SOURCE_DIR}/Tests/cmake/view_capture.cmake")
+            set_tests_properties(xtframe-view_capture_gpu_${_r} PROPERTIES TIMEOUT 300)
+        endif()
+    endforeach()
+    # T-892 (59 §59.4): a shader the wgpu GLSL frontend rejects (an out-of-range float literal, which
+    # the compiler accepts) says why in effects[].reason. wgpu only: whether a GL driver rejects that
+    # literal is up to the driver (Tests/gl checks the GL message with a broken translation instead).
+    if("wgpu" IN_LIST _renderers)
+        add_test(NAME xtframe-view_capture_gpu_broken_wgpu
+                 COMMAND ${CMAKE_COMMAND} -DVIEW=${_view} "-DDOC=${PROJECT_SOURCE_DIR}/Tests/xt/view_capture_broken.xt"
+                         -DMODE=gpu_broken -DRENDERER=wgpu "-DOUT=${CMAKE_BINARY_DIR}/xtframe-view-capture-broken-wgpu"
+                         -P "${PROJECT_SOURCE_DIR}/Tests/cmake/view_capture.cmake")
+        set_tests_properties(xtframe-view_capture_gpu_broken_wgpu PROPERTIES TIMEOUT 300)
+    endif()
     # T-759: an `xtframe-pack --atlas` bundle draws byte-identical to the plain one, per renderer
     # (view_atlas.cmake): atlas_view.xt (<img>, background image, border-image) on every renderer,
     # atlas_view_particles.xt (a textured emitter) on gl and wgpu.

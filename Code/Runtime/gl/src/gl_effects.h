@@ -113,11 +113,16 @@ public:
     void shutdown();
     /// Number of cached modules (tests).
     size_t size() const { return m_entries.size(); }
+    /// T-892: the compile (or link) message `prepare` got for module `glsl` when it failed, kept
+    /// with the failed entry (gpu::GpuDevice::customEffectFailure); empty for a module that compiled
+    /// or was never prepared.
+    std::string failure(std::string_view glsl) const;
 
 private:
     struct Entry {
         std::string glsl;
-        GLuint id = 0;  ///< 0 = the compile failed.
+        GLuint id = 0;        ///< 0 = the compile failed.
+        std::string failure;  ///< T-892: id == 0: why (the GLSL info log).
         GLint uNdc = -1, uTime = -1, uTexelSize = -1, uLayerSize = -1;
         /// T-818: XtInput.local / boxSize rows (-1 for a module translated before T-818).
         GLint uLocalRowX = -1, uLocalRowY = -1;
@@ -128,5 +133,10 @@ private:
     };
     std::vector<Entry> m_entries;  ///< program id = index + 1
 };
+
+/// The complete fragment shader CustomEffectPrograms links for the `.xtfx` GLSL module `module`
+/// (Docs/design/18-effects.md §18.7's fixed interface; T-892: its `xt` names are in
+/// xt/xtfx_reserved.h, which Tests/gl checks).
+std::string wrapCustomModule(std::string_view module);
 
 }  // namespace xt::gl

@@ -175,6 +175,7 @@ public:
     void releaseCachedTarget(gpu::TextureHandle target) override;
     uint32_t prepareCustomEffect(std::string_view glsl, const char* names, const uint8_t* types,
                                  uint32_t count) override;
+    std::string customEffectFailure(std::string_view glsl) const override;  ///< T-892
     /// T-701 (Docs/design/33-world-layers.md §33.8): a world layer's target is an RGBA8Unorm
     /// texture of this device's table (RENDER_ATTACHMENT | TEXTURE_BINDING | COPY_SRC | COPY_DST),
     /// so `texture(handle)` gives the host the WGPUTexture to sample or read back. `submitLayer`

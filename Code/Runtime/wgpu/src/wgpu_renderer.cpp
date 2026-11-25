@@ -455,6 +455,10 @@ const char* WgpuRenderer::lastError() const { return m_impl->lastError.c_str(); 
 
 bool WgpuRenderer::wantsAnotherFrame() const { return m_impl->builder.wantsAnotherFrame(); }
 
+void WgpuRenderer::setEffectReport(std::vector<gpu::FrameBuilder::EffectReport>* out) {
+    m_impl->builder.setEffectReport(out);
+}
+
 const char* WgpuRenderer::lastWarning() const { return m_impl->lastWarning.c_str(); }
 
 #ifndef XT_GPU_NO_TEXT

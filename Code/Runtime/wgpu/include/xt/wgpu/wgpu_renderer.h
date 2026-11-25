@@ -10,6 +10,7 @@
 
 #include "xt/command_list.h"
 #include "xt/damage.h"
+#include "xt/gpu/frame_builder.h"
 #include "xt/ir.h"
 #include "xt/perf.h"
 #include "xt/wgpu/wgpu_inflight.h"
@@ -247,6 +248,10 @@ public:
     /// The adapter's device name and backend, e.g. "NVIDIA GeForce RTX 4070 Ti (D3D12)", read from
     /// `WgpuInit::adapter` ("unknown adapter" when the host gave none); empty before init.
     const char* adapterName() const;
+    /// T-882 (Docs/design/59-visual-feedback.md §59.4): `gpu::FrameBuilder::setEffectReport` of this
+    /// renderer's builder -- after a render `out` holds the custom effects of the frame last built
+    /// (run, or drawn with their fallback because the WGSL did not compile). Null: nothing.
+    void setEffectReport(std::vector<gpu::FrameBuilder::EffectReport>* out);
 
     /// Copies the whole of `texture` (single-sample, COPY_SRC, a format `bytesPerTexel` knows) into
     /// `out`, tightly packed, row 0 = top: `copyTextureToBuffer` with 256-byte row alignment,

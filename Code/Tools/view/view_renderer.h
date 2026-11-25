@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
@@ -10,15 +11,18 @@
 #include "xt/command_list.h"
 #include "xt/context.h"
 #include "xt/damage.h"
+#include "xt/gpu/frame_builder.h"
 #include "xt/gpu/world_layers.h"
 #include "xt/ir.h"
 #include "xt/perf.h"
+#include "xt/sw/sw_renderer.h"
 #include "xt/types.h"
 
 namespace xt {
 class TextShaper;
 class AssetResolver;
 }  // namespace xt
+union SDL_Event;
 
 #ifndef XT_BACKEND_NO_TEXT
 namespace xt::text {
@@ -115,6 +119,10 @@ public:
     virtual bool windowed() const = 0;
     /// Windowed: the platform's events into `context` (also its viewport); false once closed.
     virtual bool pump(Context& context) = 0;
+    /// T-884: windowed: `hook` sees every platform event pump() takes before it is translated, and
+    /// true consumes it (backend::PlatformSdl2::setEventHook) -- the view hands game controllers to
+    /// xt_shell's GamepadInput this way. Empty removes it.
+    virtual void setEventHook(std::function<bool(const SDL_Event&, Context&)> hook) { (void)hook; }
     virtual void render(const CommandList& list, TextShaper* shaper, AssetResolver* assets, const IrView* ir,
                         PerfTracker* perf, const DamageList* damage) = 0;
     /// The last frame as straight-alpha RGBA8, row 0 = top (call before present() for a window).
@@ -141,6 +149,18 @@ public:
         (void)out;
         return false;
     }
+    /// T-882 (Docs/design/59-visual-feedback.md 59.4): the effect reports of the renders from now on --
+    /// a target drawing with xt_sw passes `sw` to SwRenderer::setEffectReport (appended, never cleared),
+    /// a GPU target `gpu` to gpu::FrameBuilder::setEffectReport (the last build's). False when the target
+    /// reports neither.
+    virtual bool setEffectReport(std::vector<sw::SwEffectReport>* sw,
+                                 std::vector<gpu::FrameBuilder::EffectReport>* gpu) {
+        (void)sw;
+        (void)gpu;
+        return false;
+    }
+    /// T-882: the device / driver name for the stamp's `backend` (empty: not known).
+    virtual std::string backendName() const { return {}; }
 
     // -- T-701 (Docs/design/33-world-layers.md): world layers, on the GPU renderers. --
 
